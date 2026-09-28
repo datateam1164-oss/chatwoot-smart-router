@@ -1,0 +1,15 @@
+@echo off
+echo ==========================================
+echo Starting Chatwoot Routing System...
+echo ==========================================
+
+:: الدخول لفولدر الباك إند وتسطيب المكتبات تلقائياً
+cd backend
+echo Checking and installing requirements...
+pip install -r requirements.txt
+
+:: تشغيل السيرفر
+echo Starting Python Server...
+python app.py
+
+pause

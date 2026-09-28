@@ -1,0 +1,45 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+
+# C libraries and build
+_internal/
+build/
+*.exe
+
+# Node dependencies and build
+node_modules/
+Frontend/node_modules/
+Frontend/dist/
+!Backend/dist/
+!Backend/dist/**
+
+# Virtual environments and libraries
+.env
+.venv
+env/
+venv/
+ENV/
+Lib/
+Scripts/
+**/Lib/
+**/Lib/**
+**/Scripts/
+**/Scripts/**
+Backend/Lib/
+Backend/Lib/**
+Backend/Scripts/
+Backend/Scripts/**
+
+# System and editor files
+.vscode/
+.idea/
+.DS_Store
+# Bundles and secrets
+*.zip
+Chatwoot_System_All_Code_Combined.txt
+credentials.json
+*.backup
+Backend/credentials.json

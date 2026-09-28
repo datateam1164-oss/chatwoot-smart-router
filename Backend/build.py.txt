@@ -1,0 +1,8 @@
+import subprocess
+import sys
+
+# تسطيب المكتبة للتأكيد داخل البيئة الحالية
+subprocess.run([sys.executable, -m, pip, install, google-generativeai])
+
+# تشغيل الـ Build أوتوماتيكياً
+subprocess.run([sys.executable, -m, PyInstaller, --onedir, app.py])

@@ -1,0 +1,16 @@
+@echo off
+title Chatwoot Routing & Monitoring System
+echo ====================================================
+echo  Starting Chatwoot Distribution & Monitoring System...
+echo ====================================================
+
+:: 1. فتح المتصفح تلقائياً على لوحة المراقبة الشيك بتاعتك
+echo [1/2] Opening Monitoring Dashboard in browser...
+start http://localhost:5173
+
+:: 2. الدخول لمجلد الباك إند وتشغيل السيرفر التنفيذي
+echo [2/2] Launching Routing Engine Core...
+cd backend
+app.exe
+
+pause

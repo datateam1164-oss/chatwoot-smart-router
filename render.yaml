@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: chatwoot-smart-router
+    runtime: python
+    buildCommand: pip install -r Backend/requirements.txt
+    startCommand: python Backend/app.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.0
+      - key: PYTHONUTF8
+        value: "1"

@@ -92,6 +92,8 @@ def init_db():
         cursor.execute("ALTER TABLE agents ADD COLUMN coordinator_name TEXT")
     if "manual_selected_date" not in agent_cols:
         cursor.execute("ALTER TABLE agents ADD COLUMN manual_selected_date TEXT")
+    if "manual_shift_date" not in agent_cols:
+        cursor.execute("ALTER TABLE agents ADD COLUMN manual_shift_date TEXT")
 
     cursor.execute("PRAGMA table_info(chats_log)")
     log_cols = [r["name"] for r in cursor.fetchall()]
@@ -110,24 +112,25 @@ def init_db():
         "reopen_access_token": "iyCoaajAwLLRvHGk3PAftUHi",
         "chatwoot_account_id": "1",
         "crm_base_url": "https://sales-management-system-obyr.onrender.com",
-        "crm_email": "",
-        "crm_password": "",
+        "crm_email": "data.team.116.4@gmail.com",
+        "crm_password": "AR@2026#",
         "crm_token": "",
         "crm_last_sync": "",
         "default_limit": "10",
         "default_daily_limit": "100",
         "window_minutes": "30",
-        "periodic_interval": "120",
+        "periodic_interval": "45",
         "route_unlabeled": "false",
         "valid_labels_order": json.dumps([
+            "need_to_pay",
+            "wallet",
+            "payment_method_inquiry",
             "price_inquiry",
-            "discount_inquiry",
             "high_price_complain",
+            "discount_inquiry",
             "package_compare",
             "moasker",
-            "taqfel",
-            "complete_profile",
-            "unclassified"
+            "complete_profile"
         ])
     }
 
@@ -173,7 +176,36 @@ def init_db():
 
 # ── Agents Operations ───────────────────────────────────────────────
 
+def check_and_expire_manual_shifts():
+    """
+    Ensures temporary manual shifts (إذن) expire when the day finishes.
+    If today's date is different from manual_shift_date:
+    revert shift to crm_shift_start, crm_shift_end, crm_shift_text, and reset is_manual_shift=0.
+    """
+    try:
+        now_cairo = datetime.now(CAIRO_TZ)
+        today_date = now_cairo.strftime("%Y-%m-%d")
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE agents
+            SET shift_start = crm_shift_start,
+                shift_end = crm_shift_end,
+                shift_text = crm_shift_text,
+                is_manual_shift = 0,
+                manual_shift_date = NULL,
+                updated_at = ?
+            WHERE is_manual_shift = 1 
+              AND (manual_shift_date IS NULL OR manual_shift_date != ?)
+              AND crm_shift_text IS NOT NULL
+        """, (now_cairo.isoformat(), today_date))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning("Error expiring manual shifts: %s", e)
+
 def get_all_agents():
+    check_and_expire_manual_shifts()
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM agents ORDER BY is_selected DESC, name ASC")
@@ -201,9 +233,26 @@ def upsert_agent(agent_data):
         crm_shift_start = COALESCE(:shift_start, agents.crm_shift_start),
         crm_shift_end = COALESCE(:shift_end, agents.crm_shift_end),
         crm_shift_text = COALESCE(:shift_text, agents.crm_shift_text),
-        shift_start = CASE WHEN agents.is_manual_shift = 1 THEN agents.shift_start ELSE COALESCE(:shift_start, agents.shift_start) END,
-        shift_end = CASE WHEN agents.is_manual_shift = 1 THEN agents.shift_end ELSE COALESCE(:shift_end, agents.shift_end) END,
-        shift_text = CASE WHEN agents.is_manual_shift = 1 THEN agents.shift_text ELSE COALESCE(:shift_text, agents.shift_text) END,
+        shift_start = CASE 
+            WHEN agents.is_manual_shift = 1 AND agents.manual_shift_date = :today_date THEN agents.shift_start 
+            ELSE COALESCE(:shift_start, agents.shift_start) 
+        END,
+        shift_end = CASE 
+            WHEN agents.is_manual_shift = 1 AND agents.manual_shift_date = :today_date THEN agents.shift_end 
+            ELSE COALESCE(:shift_end, agents.shift_end) 
+        END,
+        shift_text = CASE 
+            WHEN agents.is_manual_shift = 1 AND agents.manual_shift_date = :today_date THEN agents.shift_text 
+            ELSE COALESCE(:shift_text, agents.shift_text) 
+        END,
+        is_manual_shift = CASE 
+            WHEN agents.is_manual_shift = 1 AND agents.manual_shift_date = :today_date THEN 1 
+            ELSE 0 
+        END,
+        manual_shift_date = CASE 
+            WHEN agents.is_manual_shift = 1 AND agents.manual_shift_date = :today_date THEN agents.manual_shift_date 
+            ELSE NULL 
+        END,
         is_selected = CASE 
             WHEN agents.manual_selected_date = :today_date THEN agents.is_selected
             ELSE COALESCE(:is_selected, agents.is_selected)
@@ -230,13 +279,15 @@ def upsert_agent(agent_data):
     conn.close()
 
 def update_agent_shift(agent_id, shift_start, shift_end, shift_text):
+    now_cairo = datetime.now(CAIRO_TZ)
+    today_date = now_cairo.strftime("%Y-%m-%d")
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("""
         UPDATE agents 
-        SET shift_start = ?, shift_end = ?, shift_text = ?, is_manual_shift = 1, updated_at = ? 
+        SET shift_start = ?, shift_end = ?, shift_text = ?, is_manual_shift = 1, manual_shift_date = ?, updated_at = ? 
         WHERE id = ?
-    """, (shift_start, shift_end, shift_text, datetime.now(CAIRO_TZ).isoformat(), str(agent_id)))
+    """, (shift_start, shift_end, shift_text, today_date, now_cairo.isoformat(), str(agent_id)))
     conn.commit()
     conn.close()
 
@@ -249,6 +300,7 @@ def reset_agent_shift(agent_id):
             shift_end = crm_shift_end, 
             shift_text = crm_shift_text, 
             is_manual_shift = 0, 
+            manual_shift_date = NULL,
             updated_at = ? 
         WHERE id = ?
     """, (datetime.now(CAIRO_TZ).isoformat(), str(agent_id)))
@@ -605,6 +657,48 @@ def get_agent_routed_chats(agent_id, limit=100):
         WHERE agent_id = ? AND assigned_at LIKE ? 
         ORDER BY id DESC LIMIT ?
     """, (str(agent_id), f"{today_prefix}%", limit))
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+def get_routed_chats_for_audit(date_str=None, end_date_str=None, agent_id=None):
+    conn = get_db()
+    cursor = conn.cursor()
+    if not date_str:
+        date_str = datetime.now(CAIRO_TZ).strftime("%Y-%m-%d")
+    
+    if end_date_str and end_date_str != date_str:
+        date_start_clause = f"{date_str} 00:00:00"
+        date_end_clause = f"{end_date_str} 23:59:59"
+        if agent_id:
+            cursor.execute("""
+                SELECT conv_id, agent_id, agent_name, label, sender_phone, sender_name, last_message, assigned_at
+                FROM chats_log 
+                WHERE (assigned_at >= ? AND assigned_at <= ? OR assigned_at LIKE ? OR assigned_at LIKE ?) AND agent_id = ?
+                ORDER BY id DESC
+            """, (date_start_clause, date_end_clause, f"{date_str}%", f"{end_date_str}%", str(agent_id)))
+        else:
+            cursor.execute("""
+                SELECT conv_id, agent_id, agent_name, label, sender_phone, sender_name, last_message, assigned_at
+                FROM chats_log 
+                WHERE (assigned_at >= ? AND assigned_at <= ? OR assigned_at LIKE ? OR assigned_at LIKE ?)
+                ORDER BY id DESC
+            """, (date_start_clause, date_end_clause, f"{date_str}%", f"{end_date_str}%"))
+    else:
+        if agent_id:
+            cursor.execute("""
+                SELECT conv_id, agent_id, agent_name, label, sender_phone, sender_name, last_message, assigned_at
+                FROM chats_log 
+                WHERE assigned_at LIKE ? AND agent_id = ?
+                ORDER BY id DESC
+            """, (f"{date_str}%", str(agent_id)))
+        else:
+            cursor.execute("""
+                SELECT conv_id, agent_id, agent_name, label, sender_phone, sender_name, last_message, assigned_at
+                FROM chats_log 
+                WHERE assigned_at LIKE ?
+                ORDER BY id DESC
+            """, (f"{date_str}%",))
     rows = [dict(r) for r in cursor.fetchall()]
     conn.close()
     return rows

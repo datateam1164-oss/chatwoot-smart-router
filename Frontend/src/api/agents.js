@@ -458,6 +458,22 @@ export const agentsApi = {
       throw new Error(err.error || 'فشل تحديث أرقام الشاتات من شات ووت');
     }
     return res.json();
+  },
+
+  async getResolveAudit({ agentId = null, date = null, startDate = null, endDate = null, source = 'chatwoot', forceRefresh = false } = {}) {
+    const query = new URLSearchParams();
+    if (agentId) query.set('agent_id', String(agentId));
+    if (startDate) query.set('startDate', String(startDate));
+    if (endDate) query.set('endDate', String(endDate));
+    if (date && !startDate) query.set('date', String(date));
+    if (source) query.set('source', String(source));
+    if (forceRefresh) query.set('force_refresh', 'true');
+    const res = await apiFetch(`/reports/resolve-audit?${query.toString()}`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'فشل جلب تقرير فحص الريسولف');
+    }
+    return res.json();
   }
 };
 

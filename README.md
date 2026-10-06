@@ -1,3 +1,13 @@
+---
+title: Chatwoot Smart Router
+emoji: 🚀
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+pinned: false
+app_port: 7860
+---
+
 # 🚀 نظام إدارة وتوزيع محادثات Chatwoot الذكي (Chatwoot Smart Router)
 
 نظام محلي متكامل ومستقل بنسبة 100% لإدارة وتوزيع محادثات Chatwoot التلقائي، مربوط مع نظام CRM لسحب الشيفتات ومطابقتها ومراقبة تأخيرات الرد.

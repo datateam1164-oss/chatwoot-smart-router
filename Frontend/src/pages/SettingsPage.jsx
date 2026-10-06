@@ -153,13 +153,53 @@ export default function SettingsPage() {
     setSelectedLabels([]);
   };
 
+  const handleMoveLabelUp = (index) => {
+    if (index <= 0) return;
+    setSelectedLabels(prev => {
+      const next = [...prev];
+      const temp = next[index - 1];
+      next[index - 1] = next[index];
+      next[index] = temp;
+      return next;
+    });
+  };
+
+  const handleMoveLabelDown = (index) => {
+    if (index >= selectedLabels.length - 1) return;
+    setSelectedLabels(prev => {
+      const next = [...prev];
+      const temp = next[index + 1];
+      next[index + 1] = next[index];
+      next[index] = temp;
+      return next;
+    });
+  };
+
+  const handleMoveLabelToTop = (index) => {
+    if (index <= 0) return;
+    setSelectedLabels(prev => {
+      const item = prev[index];
+      const next = prev.filter((_, i) => i !== index);
+      return [item, ...next];
+    });
+  };
+
+  const handleMoveLabelToBottom = (index) => {
+    if (index >= selectedLabels.length - 1) return;
+    setSelectedLabels(prev => {
+      const item = prev[index];
+      const next = prev.filter((_, i) => i !== index);
+      return [...next, item];
+    });
+  };
+
   const handleSaveLabels = async () => {
     setSavingLabels(true);
     try {
       await agentsApi.saveLabels(selectedLabels);
-      showNotification(`تم حفظ ${selectedLabels.length} تصنيف للسيلز بنجاح!`);
+      showNotification(`Labels priority order saved successfully (${selectedLabels.length} labels)!`);
     } catch (err) {
-      showNotification('فشل حفظ تصنيفات السيلز', 'error');
+      showNotification('Failed to save labels priority order', 'error');
     } finally {
       setSavingLabels(false);
     }
@@ -252,12 +292,12 @@ export default function SettingsPage() {
         </div>
       )}
 
-      <h1 style={{ fontSize: 24, fontWeight: 800, color: '#f8fafc', marginBottom: 20 }}>
+      <h1 style={{ fontSize: 24, fontWeight: 800, color: 'var(--text-main)', marginBottom: 20 }}>
         ⚙️ إعدادات التوزيع والربط
       </h1>
 
       {/* Tabs */}
-      <div style={{ display: 'flex', gap: 10, marginBottom: 24, borderBottom: '1px solid #334155', paddingBottom: 12, flexWrap: 'wrap' }}>
+      <div style={{ display: 'flex', gap: 10, marginBottom: 24, borderBottom: '1px solid var(--border-subtle)', paddingBottom: 12, flexWrap: 'wrap' }}>
         {[
           { id: 'labels', label: `🏷️ تصنيفات السيلز (${selectedLabels.length} مصرح بها)` },
           { id: 'crm', label: '🏢 ربط الـ CRM (الشيفتات)' },
@@ -269,9 +309,9 @@ export default function SettingsPage() {
             key={t.id}
             onClick={() => setActiveTab(t.id)}
             style={{
-              background: activeTab === t.id ? '#3b82f6' : '#1e293b',
-              color: activeTab === t.id ? '#fff' : '#94a3b8',
-              border: '1px solid #334155', padding: '10px 18px', borderRadius: 8,
+              background: activeTab === t.id ? 'var(--primary)' : 'var(--bg-surface)',
+              color: activeTab === t.id ? '#fff' : 'var(--text-muted)',
+              border: '1px solid var(--border-subtle)', padding: '10px 18px', borderRadius: 8,
               fontSize: 14, fontWeight: 700, cursor: 'pointer', transition: 'all 0.2s'
             }}
           >
@@ -281,18 +321,18 @@ export default function SettingsPage() {
       </div>
 
       {loading ? (
-        <div style={{ padding: 40, textAlign: 'center', color: '#94a3b8' }}>جاري التحميل...</div>
+        <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-muted)' }}>جاري التحميل...</div>
       ) : (
         <div>
           {/* Labels Tab */}
           {activeTab === 'labels' && (
-            <div style={{ background: '#1e293b', border: '1px solid #334155', borderRadius: 12, padding: 24 }}>
+            <div style={{ background: 'var(--bg-surface)', border: '1px solid var(--border-subtle)', boxShadow: 'var(--shadow-card)', borderRadius: 12, padding: 24 }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 20, flexWrap: 'wrap', gap: 12 }}>
                 <div>
-                  <h2 style={{ fontSize: 18, fontWeight: 700, margin: '0 0 6px', color: '#f8fafc' }}>
+                  <h2 style={{ fontSize: 18, fontWeight: 700, margin: '0 0 6px', color: 'var(--text-main)' }}>
                     🏷️ تحديد ليبولات السيلز المصرح بتوزيعها
                   </h2>
-                  <p style={{ margin: 0, color: '#94a3b8', fontSize: 13 }}>
+                  <p style={{ margin: 0, color: 'var(--text-muted)', fontSize: 13 }}>
                     ⚠️ أي محادثة تحتوي على ليبل آخر (مثل ليبولات الـ CS أو HR) أو بدون ليبل مصرح به، <strong>سيتم تخطيها ولن توزع نهائياً لموظفي السيلز</strong>.
                   </p>
                 </div>
@@ -318,15 +358,15 @@ export default function SettingsPage() {
                   value={labelSearch}
                   onChange={(e) => setLabelSearch(e.target.value)}
                   style={{
-                    flex: 1, minWidth: 200, background: '#0f172a', border: '1px solid #334155',
-                    color: '#fff', padding: '8px 14px', borderRadius: 6, fontSize: 13
+                    flex: 1, minWidth: 200, background: 'var(--bg-input)', border: '1px solid var(--border-subtle)',
+                    color: 'var(--text-main)', padding: '8px 14px', borderRadius: 6, fontSize: 13
                   }}
                 />
 
                 <button
                   onClick={handleSelectAllLabels}
                   style={{
-                    background: '#334155', color: '#e2e8f0', border: 'none', padding: '8px 14px',
+                    background: 'var(--bg-surface-elevated)', color: 'var(--text-main)', border: '1px solid var(--border-subtle)', padding: '8px 14px',
                     borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer'
                   }}
                 >
@@ -336,7 +376,7 @@ export default function SettingsPage() {
                 <button
                   onClick={handleClearAllLabels}
                   style={{
-                    background: '#334155', color: '#e2e8f0', border: 'none', padding: '8px 14px',
+                    background: 'var(--bg-surface-elevated)', color: 'var(--text-main)', border: '1px solid var(--border-subtle)', padding: '8px 14px',
                     borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer'
                   }}
                 >
@@ -365,8 +405,8 @@ export default function SettingsPage() {
                         justifyContent: 'space-between',
                         padding: '12px 16px',
                         borderRadius: 8,
-                        border: isSelected ? '2px solid #3b82f6' : '1px solid #334155',
-                        background: isSelected ? 'rgba(59, 130, 246, 0.12)' : '#0f172a',
+                        border: isSelected ? '2px solid var(--primary)' : '1px solid var(--border-subtle)',
+                        background: isSelected ? 'var(--primary-bg)' : 'var(--bg-surface-elevated)',
                         cursor: 'pointer',
                         transition: 'all 0.15s ease'
                       }}
@@ -376,20 +416,20 @@ export default function SettingsPage() {
                           type="checkbox"
                           checked={isSelected}
                           onChange={() => {}} // Handled by parent div
-                          style={{ width: 16, height: 16, cursor: 'pointer', accentColor: '#3b82f6' }}
+                          style={{ width: 16, height: 16, cursor: 'pointer', accentColor: 'var(--primary)' }}
                         />
                         <div>
                           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                             <span style={{
                               display: 'inline-block', width: 8, height: 8, borderRadius: '50%',
-                              background: lbl.color || '#3b82f6'
+                              background: lbl.color || 'var(--primary)'
                             }} />
-                            <span style={{ fontWeight: 700, fontSize: 13, color: isSelected ? '#38bdf8' : '#e2e8f0' }}>
+                            <span style={{ fontWeight: 700, fontSize: 13, color: isSelected ? 'var(--primary)' : 'var(--text-main)' }}>
                               {lbl.title}
                             </span>
                           </div>
                           {lbl.description && (
-                            <div style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>{lbl.description}</div>
+                            <div style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 2 }}>{lbl.description}</div>
                           )}
                         </div>
                       </div>
@@ -399,14 +439,226 @@ export default function SettingsPage() {
                         fontWeight: 600,
                         padding: '2px 8px',
                         borderRadius: 4,
-                        background: isSelected ? '#1e3a8a' : '#1e293b',
-                        color: isSelected ? '#93c5fd' : '#64748b'
+                        background: isSelected ? 'var(--primary-bg)' : 'var(--bg-surface)',
+                        color: isSelected ? 'var(--primary)' : 'var(--text-dim)',
+                        border: '1px solid var(--border-subtle)'
                       }}>
                         {isSelected ? 'مسموح للسيلز ✅' : 'مستبعد ⛔'}
                       </span>
                     </div>
                   );
                 })}
+              </div>
+
+              {/* ───────────────────────────────────────────────────────────── */}
+              {/* English Label Distribution Priority Queue (Ranked Order) */}
+              {/* ───────────────────────────────────────────────────────────── */}
+              <div style={{
+                marginTop: 26,
+                background: 'var(--bg-surface-elevated)',
+                border: '1px solid var(--border-subtle)',
+                borderRadius: 12,
+                padding: 20
+              }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: 12, marginBottom: 16 }}>
+                  <div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ fontSize: 20 }}>🎯</span>
+                      <h3 style={{ margin: 0, fontSize: 16, fontWeight: 800, color: 'var(--text-main)' }}>
+                        Label Distribution Priority Queue
+                      </h3>
+                      <span style={{
+                        background: 'var(--primary-bg)',
+                        color: 'var(--primary)',
+                        padding: '2px 8px',
+                        borderRadius: 6,
+                        fontSize: 11,
+                        fontWeight: 800
+                      }}>
+                        {selectedLabels.length} Active Labels
+                      </span>
+                    </div>
+                    <p style={{ margin: '6px 0 0', color: 'var(--text-muted)', fontSize: 12, maxWidth: 680, lineHeight: 1.5 }}>
+                      Rank #1 is the highest priority. The smart router distributes all unassigned chats matching <strong>Rank #1</strong> first. Once completed, it dispatches Rank #2, Rank #3, etc., while ensuring fair, balanced round-robin among active agents.
+                    </p>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={handleSaveLabels}
+                    disabled={savingLabels}
+                    style={{
+                      background: 'var(--primary)',
+                      color: '#ffffff',
+                      border: 'none',
+                      padding: '8px 18px',
+                      borderRadius: 8,
+                      fontWeight: 800,
+                      fontSize: 12,
+                      cursor: savingLabels ? 'wait' : 'pointer',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 6
+                    }}
+                  >
+                    <span>{savingLabels ? '⏳ Saving...' : '💾 Save Priority Order'}</span>
+                  </button>
+                </div>
+
+                {selectedLabels.length === 0 ? (
+                  <div style={{ padding: 24, textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>
+                    No sales labels currently selected. Please select labels from the catalog above.
+                  </div>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                    {selectedLabels.map((lblTitle, idx) => {
+                      const foundObj = allLabels.find(l => l.title.toLowerCase() === lblTitle.toLowerCase());
+                      const isTop = idx === 0;
+                      const isBottom = idx === selectedLabels.length - 1;
+
+                      return (
+                        <div
+                          key={lblTitle}
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'space-between',
+                            padding: '10px 14px',
+                            borderRadius: 8,
+                            background: isTop ? 'var(--primary-bg)' : 'var(--bg-surface)',
+                            border: `1px solid ${isTop ? 'var(--primary)' : 'var(--border-subtle)'}`,
+                            transition: 'all 0.15s'
+                          }}
+                        >
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                            {/* Rank Badge */}
+                            <span style={{
+                              background: isTop ? 'var(--primary)' : 'var(--bg-surface-elevated)',
+                              color: isTop ? '#ffffff' : 'var(--text-muted)',
+                              fontWeight: 900,
+                              fontSize: 12,
+                              padding: '3px 8px',
+                              borderRadius: 6,
+                              minWidth: 70,
+                              textAlign: 'center',
+                              fontVariantNumeric: 'tabular-nums'
+                            }}>
+                              {isTop ? '🥇 Rank #1' : idx === 1 ? '🥈 Rank #2' : idx === 2 ? '🥉 Rank #3' : `Rank #${idx + 1}`}
+                            </span>
+
+                            {/* Label Dot & Title */}
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                              <span style={{
+                                width: 10,
+                                height: 10,
+                                borderRadius: '50%',
+                                background: foundObj?.color || 'var(--primary)'
+                              }} />
+                              <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-main)' }}>
+                                {lblTitle}
+                              </span>
+                              {isTop && (
+                                <span style={{
+                                  fontSize: 10,
+                                  fontWeight: 800,
+                                  background: 'var(--badge-ready-bg)',
+                                  color: 'var(--badge-ready-text)',
+                                  padding: '2px 6px',
+                                  borderRadius: 4
+                                }}>
+                                  Top Priority (Distributed First)
+                                </span>
+                              )}
+                            </div>
+                          </div>
+
+                          {/* Reorder Action Buttons (English) */}
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                            <button
+                              type="button"
+                              onClick={() => handleMoveLabelToTop(idx)}
+                              disabled={isTop}
+                              style={{
+                                background: 'var(--bg-surface-elevated)',
+                                border: '1px solid var(--border-subtle)',
+                                color: isTop ? 'var(--text-dim)' : 'var(--text-main)',
+                                padding: '4px 8px',
+                                borderRadius: 6,
+                                fontSize: 11,
+                                fontWeight: 700,
+                                cursor: isTop ? 'not-allowed' : 'pointer',
+                                opacity: isTop ? 0.4 : 1
+                              }}
+                              title="Move to Top"
+                            >
+                              🔝 Top
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() => handleMoveLabelUp(idx)}
+                              disabled={isTop}
+                              style={{
+                                background: 'var(--bg-surface-elevated)',
+                                border: '1px solid var(--border-subtle)',
+                                color: isTop ? 'var(--text-dim)' : 'var(--primary)',
+                                padding: '4px 10px',
+                                borderRadius: 6,
+                                fontSize: 12,
+                                fontWeight: 800,
+                                cursor: isTop ? 'not-allowed' : 'pointer',
+                                opacity: isTop ? 0.4 : 1
+                              }}
+                              title="Move Up"
+                            >
+                              ⬆️ Up
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() => handleMoveLabelDown(idx)}
+                              disabled={isBottom}
+                              style={{
+                                background: 'var(--bg-surface-elevated)',
+                                border: '1px solid var(--border-subtle)',
+                                color: isBottom ? 'var(--text-dim)' : 'var(--primary)',
+                                padding: '4px 10px',
+                                borderRadius: 6,
+                                fontSize: 12,
+                                fontWeight: 800,
+                                cursor: isBottom ? 'not-allowed' : 'pointer',
+                                opacity: isBottom ? 0.4 : 1
+                              }}
+                              title="Move Down"
+                            >
+                              ⬇️ Down
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() => handleMoveLabelToBottom(idx)}
+                              disabled={isBottom}
+                              style={{
+                                background: 'var(--bg-surface-elevated)',
+                                border: '1px solid var(--border-subtle)',
+                                color: isBottom ? 'var(--text-dim)' : 'var(--text-main)',
+                                padding: '4px 8px',
+                                borderRadius: 6,
+                                fontSize: 11,
+                                fontWeight: 700,
+                                cursor: isBottom ? 'not-allowed' : 'pointer',
+                                opacity: isBottom ? 0.4 : 1
+                              }}
+                              title="Move to Bottom"
+                            >
+                              🔻 Bottom
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
 
               <div style={{ marginTop: 20, textAlign: 'left' }}>
@@ -418,7 +670,7 @@ export default function SettingsPage() {
                     borderRadius: 8, fontWeight: 700, fontSize: 14, cursor: savingLabels ? 'wait' : 'pointer'
                   }}
                 >
-                  {savingLabels ? '⏳ جاري الحفظ...' : '💾 حفظ التصنيفات المعتمدة'}
+                  {savingLabels ? '⏳ Saving...' : '💾 Save Authorized Labels & Priority'}
                 </button>
               </div>
             </div>
@@ -426,26 +678,26 @@ export default function SettingsPage() {
 
           {/* CRM Tab */}
           {activeTab === 'crm' && (
-            <div style={{ background: '#1e293b', border: '1px solid #334155', borderRadius: 12, padding: 24 }}>
-              <h2 style={{ fontSize: 18, fontWeight: 700, marginBottom: 16, color: '#f8fafc' }}>
+            <div style={{ background: 'var(--bg-surface)', border: '1px solid var(--border-subtle)', boxShadow: 'var(--shadow-card)', borderRadius: 12, padding: 24 }}>
+              <h2 style={{ fontSize: 18, fontWeight: 700, marginBottom: 16, color: 'var(--text-main)' }}>
                 🏢 إعدادات حساب الـ CRM (Sales Management System)
               </h2>
               <form onSubmit={handleSaveSettings}>
                 <div style={{ marginBottom: 16 }}>
-                  <label style={{ display: 'block', color: '#cbd5e1', fontSize: 13, fontWeight: 600, marginBottom: 6 }}>
+                  <label style={{ display: 'block', color: 'var(--text-main)', fontSize: 13, fontWeight: 600, marginBottom: 6 }}>
                     رابط السيرفر الأساسي (Base URL)
                   </label>
                   <input
                     type="text"
                     value={settings.crm_base_url || 'https://sales-management-system-obyr.onrender.com'}
                     onChange={(e) => setSettings({ ...settings, crm_base_url: e.target.value })}
-                    style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#fff', padding: '10px 14px', borderRadius: 6 }}
+                    style={{ width: '100%', background: 'var(--bg-input)', border: '1px solid var(--border-subtle)', color: 'var(--text-main)', padding: '10px 14px', borderRadius: 6 }}
                   />
                 </div>
 
                 <div style={{ display: 'flex', gap: 16, marginBottom: 20, flexWrap: 'wrap' }}>
                   <div style={{ flex: 1, minWidth: 260 }}>
-                    <label style={{ display: 'block', color: '#cbd5e1', fontSize: 13, fontWeight: 600, marginBottom: 6 }}>
+                    <label style={{ display: 'block', color: 'var(--text-main)', fontSize: 13, fontWeight: 600, marginBottom: 6 }}>
                       البريد الإلكتروني للـ CRM
                     </label>
                     <input
@@ -453,12 +705,12 @@ export default function SettingsPage() {
                       value={settings.crm_email || ''}
                       onChange={(e) => setSettings({ ...settings, crm_email: e.target.value })}
                       placeholder="data.team.116.4@gmail.com"
-                      style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#fff', padding: '10px 14px', borderRadius: 6 }}
+                      style={{ width: '100%', background: 'var(--bg-input)', border: '1px solid var(--border-subtle)', color: 'var(--text-main)', padding: '10px 14px', borderRadius: 6 }}
                     />
                   </div>
 
                   <div style={{ flex: 1, minWidth: 260 }}>
-                    <label style={{ display: 'block', color: '#cbd5e1', fontSize: 13, fontWeight: 600, marginBottom: 6 }}>
+                    <label style={{ display: 'block', color: 'var(--text-main)', fontSize: 13, fontWeight: 600, marginBottom: 6 }}>
                       كلمة المرور (Password)
                     </label>
                     <input
@@ -466,7 +718,7 @@ export default function SettingsPage() {
                       value={settings.crm_password || ''}
                       onChange={(e) => setSettings({ ...settings, crm_password: e.target.value })}
                       placeholder="••••••••"
-                      style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#fff', padding: '10px 14px', borderRadius: 6 }}
+                      style={{ width: '100%', background: 'var(--bg-input)', border: '1px solid var(--border-subtle)', color: 'var(--text-main)', padding: '10px 14px', borderRadius: 6 }}
                     />
                   </div>
                 </div>
@@ -476,7 +728,7 @@ export default function SettingsPage() {
                     type="submit"
                     disabled={saving}
                     style={{
-                      background: '#3b82f6', color: '#fff', border: 'none', padding: '10px 24px',
+                      background: 'var(--primary)', color: '#fff', border: 'none', padding: '10px 24px',
                       borderRadius: 6, fontWeight: 700, cursor: saving ? 'wait' : 'pointer'
                     }}
                   >
@@ -501,45 +753,45 @@ export default function SettingsPage() {
 
           {/* Chatwoot Tab */}
           {activeTab === 'chatwoot' && (
-            <div style={{ background: '#1e293b', border: '1px solid #334155', borderRadius: 12, padding: 24 }}>
-              <h2 style={{ fontSize: 18, fontWeight: 700, marginBottom: 16, color: '#f8fafc' }}>
+            <div style={{ background: 'var(--bg-surface)', border: '1px solid var(--border-subtle)', boxShadow: 'var(--shadow-card)', borderRadius: 12, padding: 24 }}>
+              <h2 style={{ fontSize: 18, fontWeight: 700, marginBottom: 16, color: 'var(--text-main)' }}>
                 💬 إعدادات الاتصال بـ Chatwoot
               </h2>
               <form onSubmit={handleSaveSettings}>
                 <div style={{ marginBottom: 16 }}>
-                  <label style={{ display: 'block', color: '#cbd5e1', fontSize: 13, fontWeight: 600, marginBottom: 6 }}>
+                  <label style={{ display: 'block', color: 'var(--text-main)', fontSize: 13, fontWeight: 600, marginBottom: 6 }}>
                     رابط منصة Chatwoot
                   </label>
                   <input
                     type="text"
                     value={settings.chatwoot_base_url || 'https://crm.elkheta.com'}
                     onChange={(e) => setSettings({ ...settings, chatwoot_base_url: e.target.value })}
-                    style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#fff', padding: '10px 14px', borderRadius: 6 }}
+                    style={{ width: '100%', background: 'var(--bg-input)', border: '1px solid var(--border-subtle)', color: 'var(--text-main)', padding: '10px 14px', borderRadius: 6 }}
                   />
                 </div>
 
                 <div style={{ display: 'flex', gap: 16, marginBottom: 20, flexWrap: 'wrap' }}>
                   <div style={{ flex: 1, minWidth: 260 }}>
-                    <label style={{ display: 'block', color: '#cbd5e1', fontSize: 13, fontWeight: 600, marginBottom: 6 }}>
+                    <label style={{ display: 'block', color: 'var(--text-main)', fontSize: 13, fontWeight: 600, marginBottom: 6 }}>
                       رمز الوصول (API Access Token)
                     </label>
                     <input
                       type="text"
                       value={settings.chatwoot_access_token || ''}
                       onChange={(e) => setSettings({ ...settings, chatwoot_access_token: e.target.value })}
-                      style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#fff', padding: '10px 14px', borderRadius: 6, fontFamily: 'monospace' }}
+                      style={{ width: '100%', background: 'var(--bg-input)', border: '1px solid var(--border-subtle)', color: 'var(--text-main)', padding: '10px 14px', borderRadius: 6, fontFamily: 'monospace' }}
                     />
                   </div>
 
                   <div style={{ width: 140 }}>
-                    <label style={{ display: 'block', color: '#cbd5e1', fontSize: 13, fontWeight: 600, marginBottom: 6 }}>
+                    <label style={{ display: 'block', color: 'var(--text-main)', fontSize: 13, fontWeight: 600, marginBottom: 6 }}>
                       Account ID
                     </label>
                     <input
                       type="text"
                       value={settings.chatwoot_account_id || '1'}
                       onChange={(e) => setSettings({ ...settings, chatwoot_account_id: e.target.value })}
-                      style={{ width: '100%', background: '#0f172a', border: '1px solid #334155', color: '#fff', padding: '10px 14px', borderRadius: 6 }}
+                      style={{ width: '100%', background: 'var(--bg-input)', border: '1px solid var(--border-subtle)', color: 'var(--text-main)', padding: '10px 14px', borderRadius: 6 }}
                     />
                   </div>
                 </div>
@@ -548,7 +800,7 @@ export default function SettingsPage() {
                   type="submit"
                   disabled={saving}
                   style={{
-                    background: '#3b82f6', color: '#fff', border: 'none', padding: '10px 24px',
+                    background: 'var(--primary)', color: '#fff', border: 'none', padding: '10px 24px',
                     borderRadius: 6, fontWeight: 700, cursor: saving ? 'wait' : 'pointer'
                   }}
                 >
@@ -560,18 +812,18 @@ export default function SettingsPage() {
 
           {/* Mappings Tab */}
           {activeTab === 'mappings' && (
-            <div style={{ background: '#1e293b', border: '1px solid #334155', borderRadius: 12, padding: 24 }}>
-              <h2 style={{ fontSize: 18, fontWeight: 700, marginBottom: 8, color: '#f8fafc' }}>
+            <div style={{ background: 'var(--bg-surface)', border: '1px solid var(--border-subtle)', boxShadow: 'var(--shadow-card)', borderRadius: 12, padding: 24 }}>
+              <h2 style={{ fontSize: 18, fontWeight: 700, marginBottom: 8, color: 'var(--text-main)' }}>
                 🔗 مطابقة أسماء الموظفين بين الـ CRM وشات ووت
               </h2>
-              <p style={{ color: '#94a3b8', fontSize: 13, marginBottom: 20 }}>
+              <p style={{ color: 'var(--text-muted)', fontSize: 13, marginBottom: 20 }}>
                 النظام يطابق الموظفين تلقائياً بنسبة 99% من خلال الإيميل المشترك. يمكنك استخدام هذا النموذج لربط أي موظف لم يطابق اسمه آلياً.
               </p>
 
               {/* Add Mapping Form */}
               <form onSubmit={handleAddMapping} style={{ display: 'flex', gap: 12, marginBottom: 24, flexWrap: 'wrap', alignItems: 'flex-end' }}>
                 <div style={{ flex: 1, minWidth: 220 }}>
-                  <label style={{ display: 'block', color: '#cbd5e1', fontSize: 12, fontWeight: 600, marginBottom: 4 }}>
+                  <label style={{ display: 'block', color: 'var(--text-main)', fontSize: 12, fontWeight: 600, marginBottom: 4 }}>
                     الاسم المسجل في الـ CRM
                   </label>
                   <input
@@ -579,18 +831,18 @@ export default function SettingsPage() {
                     value={newCrmName}
                     onChange={(e) => setNewCrmName(e.target.value)}
                     placeholder="مثال: Maryam Hassan"
-                    style={{ width: '100%', background: '#1e293b', border: '1px solid #334155', color: '#fff', padding: '8px 12px', borderRadius: 6 }}
+                    style={{ width: '100%', background: 'var(--bg-input)', border: '1px solid var(--border-subtle)', color: 'var(--text-main)', padding: '8px 12px', borderRadius: 6 }}
                   />
                 </div>
 
                 <div style={{ flex: 1, minWidth: 220 }}>
-                  <label style={{ display: 'block', color: '#cbd5e1', fontSize: 12, fontWeight: 600, marginBottom: 4 }}>
+                  <label style={{ display: 'block', color: 'var(--text-main)', fontSize: 12, fontWeight: 600, marginBottom: 4 }}>
                     الموظف المناظر في شات ووت
                   </label>
                   <select
                     value={selectedAgentId}
                     onChange={(e) => setSelectedAgentId(e.target.value)}
-                    style={{ width: '100%', background: '#1e293b', border: '1px solid #334155', color: '#fff', padding: '8px 12px', borderRadius: 6 }}
+                    style={{ width: '100%', background: 'var(--bg-input)', border: '1px solid var(--border-subtle)', color: 'var(--text-main)', padding: '8px 12px', borderRadius: 6 }}
                   >
                     <option value="">— اختر الموظف —</option>
                     {agents.map(a => (
@@ -613,7 +865,7 @@ export default function SettingsPage() {
               {/* Existing Mappings Table */}
               <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'right', fontSize: 13 }}>
                 <thead>
-                  <tr style={{ background: '#0f172a', color: '#94a3b8', borderBottom: '1px solid #334155' }}>
+                  <tr style={{ background: 'var(--bg-surface-elevated)', color: 'var(--text-muted)', borderBottom: '1px solid var(--border-subtle)' }}>
                     <th style={{ padding: '10px 14px' }}>الاسم في الـ CRM</th>
                     <th style={{ padding: '10px 14px' }}>الموظف في شات ووت</th>
                     <th style={{ padding: '10px 14px' }}>Chatwoot ID</th>
@@ -622,16 +874,16 @@ export default function SettingsPage() {
                 <tbody>
                   {mappings.length === 0 ? (
                     <tr>
-                      <td colSpan="3" style={{ padding: 20, textAlign: 'center', color: '#64748b' }}>
+                      <td colSpan="3" style={{ padding: 20, textAlign: 'center', color: 'var(--text-dim)' }}>
                         لا توجد روابط مخصصة حالياً (السيستم يطابق الأسماء المتشابهة تلقائياً)
                       </td>
                     </tr>
                   ) : (
                     mappings.map((m, idx) => (
-                      <tr key={idx} style={{ borderBottom: '1px solid #334155' }}>
-                        <td style={{ padding: '10px 14px', color: '#f8fafc', fontWeight: 600 }}>{m.crm_name}</td>
-                        <td style={{ padding: '10px 14px', color: '#38bdf8' }}>{m.chatwoot_agent_name}</td>
-                        <td style={{ padding: '10px 14px', color: '#94a3b8' }}>{m.chatwoot_agent_id}</td>
+                      <tr key={idx} style={{ borderBottom: '1px solid var(--border-subtle)' }}>
+                        <td style={{ padding: '10px 14px', color: 'var(--text-main)', fontWeight: 600 }}>{m.crm_name}</td>
+                        <td style={{ padding: '10px 14px', color: 'var(--primary)' }}>{m.chatwoot_agent_name}</td>
+                        <td style={{ padding: '10px 14px', color: 'var(--text-muted)' }}>{m.chatwoot_agent_id}</td>
                       </tr>
                     ))
                   )}
@@ -642,13 +894,13 @@ export default function SettingsPage() {
 
           {/* Security Tab */}
           {activeTab === 'security' && (
-            <div style={{ background: '#1e293b', border: '1px solid #334155', borderRadius: 12, padding: 24 }}>
+            <div style={{ background: 'var(--bg-surface)', border: '1px solid var(--border-subtle)', boxShadow: 'var(--shadow-card)', borderRadius: 12, padding: 24 }}>
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20, flexWrap: 'wrap', gap: 10 }}>
                 <div>
-                  <h2 style={{ fontSize: 18, fontWeight: 700, color: '#f8fafc', marginBottom: 4 }}>
+                  <h2 style={{ fontSize: 18, fontWeight: 700, color: 'var(--text-main)', marginBottom: 4 }}>
                     🔐 أمان النظام وبيانات الدخول
                   </h2>
-                  <p style={{ fontSize: 13, color: '#94a3b8' }}>
+                  <p style={{ fontSize: 13, color: 'var(--text-muted)' }}>
                     تغيير اسم المستخدم أو كلمة المرور الخاصة بالدخول للنظام على هذا السيرفر أو السحابة
                   </p>
                 </div>
@@ -657,28 +909,28 @@ export default function SettingsPage() {
                   display: 'inline-flex',
                   alignItems: 'center',
                   gap: 8,
-                  background: 'rgba(56,189,248,0.1)',
-                  border: '1px solid rgba(56,189,248,0.25)',
+                  background: 'var(--primary-bg)',
+                  border: '1px solid var(--primary-border)',
                   padding: '6px 14px',
                   borderRadius: 20,
                   fontSize: 13,
-                  color: '#38bdf8',
+                  color: 'var(--primary)',
                   fontWeight: 700
                 }}>
                   <span>👤 الحساب النشط:</span>
-                  <span style={{ color: '#fff' }}>{currentUsername}</span>
-                  <span style={{ color: '#94a3b8', fontSize: 11 }}>(مسؤول النظام)</span>
+                  <span style={{ color: 'var(--text-main)' }}>{currentUsername}</span>
+                  <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>(مسؤول النظام)</span>
                 </div>
               </div>
 
               <div style={{
-                background: 'rgba(245,158,11,0.08)',
-                border: '1px solid rgba(245,158,11,0.25)',
+                background: 'var(--badge-paused-bg)',
+                border: '1px solid var(--badge-paused-border)',
                 borderRadius: 10,
                 padding: '12px 16px',
                 marginBottom: 24,
                 fontSize: 13,
-                color: '#fbbf24',
+                color: 'var(--badge-paused-text)',
                 display: 'flex',
                 alignItems: 'center',
                 gap: 10
@@ -691,7 +943,7 @@ export default function SettingsPage() {
 
               <form onSubmit={handleUpdateSecurity} style={{ maxWidth: 500, display: 'flex', flexDirection: 'column', gap: 18 }}>
                 <div>
-                  <label style={{ display: 'block', fontSize: 13, fontWeight: 700, color: '#cbd5e1', marginBottom: 6 }}>
+                  <label style={{ display: 'block', fontSize: 13, fontWeight: 700, color: 'var(--text-main)', marginBottom: 6 }}>
                     اسم المستخدم الجديد (اتركه فارغاً إذا كنت لا ترغب بتغييره)
                   </label>
                   <input
@@ -702,10 +954,10 @@ export default function SettingsPage() {
                     style={{
                       width: '100%',
                       padding: '10px 14px',
-                      background: '#0f172a',
-                      border: '1px solid #334155',
+                      background: 'var(--bg-input)',
+                      border: '1px solid var(--border-subtle)',
                       borderRadius: 8,
-                      color: '#f8fafc',
+                      color: 'var(--text-main)',
                       fontSize: 14,
                       outline: 'none'
                     }}
@@ -713,7 +965,7 @@ export default function SettingsPage() {
                 </div>
 
                 <div>
-                  <label style={{ display: 'block', fontSize: 13, fontWeight: 700, color: '#cbd5e1', marginBottom: 6 }}>
+                  <label style={{ display: 'block', fontSize: 13, fontWeight: 700, color: 'var(--text-main)', marginBottom: 6 }}>
                     كلمة المرور الحالية <span style={{ color: '#ef4444' }}>* (مطلوبة لتأكيد الهوية)</span>
                   </label>
                   <input
@@ -725,10 +977,10 @@ export default function SettingsPage() {
                     style={{
                       width: '100%',
                       padding: '10px 14px',
-                      background: '#0f172a',
-                      border: '1px solid #334155',
+                      background: 'var(--bg-input)',
+                      border: '1px solid var(--border-subtle)',
                       borderRadius: 8,
-                      color: '#f8fafc',
+                      color: 'var(--text-main)',
                       fontSize: 14,
                       outline: 'none'
                     }}
@@ -736,7 +988,7 @@ export default function SettingsPage() {
                 </div>
 
                 <div>
-                  <label style={{ display: 'block', fontSize: 13, fontWeight: 700, color: '#cbd5e1', marginBottom: 6 }}>
+                  <label style={{ display: 'block', fontSize: 13, fontWeight: 700, color: 'var(--text-main)', marginBottom: 6 }}>
                     كلمة المرور الجديدة (اتركها فارغة إذا أردت تغيير اسم المستخدم فقط)
                   </label>
                   <input
@@ -747,10 +999,10 @@ export default function SettingsPage() {
                     style={{
                       width: '100%',
                       padding: '10px 14px',
-                      background: '#0f172a',
-                      border: '1px solid #334155',
+                      background: 'var(--bg-input)',
+                      border: '1px solid var(--border-subtle)',
                       borderRadius: 8,
-                      color: '#f8fafc',
+                      color: 'var(--text-main)',
                       fontSize: 14,
                       outline: 'none'
                     }}
@@ -758,7 +1010,7 @@ export default function SettingsPage() {
                 </div>
 
                 <div>
-                  <label style={{ display: 'block', fontSize: 13, fontWeight: 700, color: '#cbd5e1', marginBottom: 6 }}>
+                  <label style={{ display: 'block', fontSize: 13, fontWeight: 700, color: 'var(--text-main)', marginBottom: 6 }}>
                     تأكيد كلمة المرور الجديدة
                   </label>
                   <input
@@ -769,10 +1021,10 @@ export default function SettingsPage() {
                     style={{
                       width: '100%',
                       padding: '10px 14px',
-                      background: '#0f172a',
-                      border: '1px solid #334155',
+                      background: 'var(--bg-input)',
+                      border: '1px solid var(--border-subtle)',
                       borderRadius: 8,
-                      color: '#f8fafc',
+                      color: 'var(--text-main)',
                       fontSize: 14,
                       outline: 'none'
                     }}
@@ -786,7 +1038,7 @@ export default function SettingsPage() {
                     marginTop: 6,
                     padding: '11px 20px',
                     borderRadius: 8,
-                    background: savingSecurity ? '#64748b' : '#3b82f6',
+                    background: savingSecurity ? '#64748b' : 'var(--primary)',
                     color: '#fff',
                     fontWeight: 700,
                     fontSize: 14,
@@ -794,7 +1046,7 @@ export default function SettingsPage() {
                     cursor: savingSecurity ? 'not-allowed' : 'pointer',
                     transition: 'all 0.2s',
                     alignSelf: 'flex-start',
-                    boxShadow: '0 2px 10px rgba(59,130,246,0.3)'
+                    boxShadow: '0 2px 10px var(--primary-bg)'
                   }}
                 >
                   {savingSecurity ? 'جاري الحفظ...' : '💾 حفظ التعديلات الأمنية'}
@@ -802,13 +1054,13 @@ export default function SettingsPage() {
               </form>
 
               {/* Team Users Management Section */}
-              <div style={{ marginTop: 32, paddingTop: 24, borderTop: '1px solid #334155' }}>
+              <div style={{ marginTop: 32, paddingTop: 24, borderTop: '1px solid var(--border-subtle)' }}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
                   <div>
-                    <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: '#f8fafc' }}>
+                    <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: 'var(--text-main)' }}>
                       👥 إدارة مستخدمي النظام وفريق العمل
                     </h3>
-                    <p style={{ margin: '4px 0 0 0', fontSize: 13, color: '#94a3b8' }}>
+                    <p style={{ margin: '4px 0 0 0', fontSize: 13, color: 'var(--text-muted)' }}>
                       أنشئ حسابات دخول خاصة للزملاء في التيم لمتابعة وإدارة لوحة التحكم
                     </p>
                   </div>
@@ -816,10 +1068,10 @@ export default function SettingsPage() {
                     onClick={loadUsers}
                     disabled={loadingUsers}
                     style={{
-                      background: '#1e293b',
-                      border: '1px solid #334155',
+                      background: 'var(--bg-surface-elevated)',
+                      border: '1px solid var(--border-subtle)',
                       borderRadius: 6,
-                      color: '#38bdf8',
+                      color: 'var(--primary)',
                       padding: '6px 12px',
                       fontSize: 12,
                       fontWeight: 600,
@@ -832,15 +1084,15 @@ export default function SettingsPage() {
 
                 {/* Users List Table */}
                 <div style={{
-                  background: '#0f172a',
-                  border: '1px solid #334155',
+                  background: 'var(--bg-surface-elevated)',
+                  border: '1px solid var(--border-subtle)',
                   borderRadius: 10,
                   overflow: 'hidden',
                   marginBottom: 20
                 }}>
                   <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13, textAlign: 'right' }}>
                     <thead>
-                      <tr style={{ background: '#1e293b', borderBottom: '1px solid #334155', color: '#cbd5e1' }}>
+                      <tr style={{ background: 'var(--bg-surface)', borderBottom: '1px solid var(--border-subtle)', color: 'var(--text-muted)' }}>
                         <th style={{ padding: '10px 14px' }}>المعرف</th>
                         <th style={{ padding: '10px 14px' }}>اسم المستخدم</th>
                         <th style={{ padding: '10px 14px' }}>الصلاحية</th>
@@ -852,15 +1104,15 @@ export default function SettingsPage() {
                       {teamUsers.map((u) => {
                         const isSelf = u.username === currentUsername;
                         return (
-                          <tr key={u.id} style={{ borderBottom: '1px solid #1e293b', color: '#f8fafc' }}>
-                            <td style={{ padding: '10px 14px', color: '#64748b' }}>#{u.id}</td>
+                          <tr key={u.id} style={{ borderBottom: '1px solid var(--border-subtle)', color: 'var(--text-main)' }}>
+                            <td style={{ padding: '10px 14px', color: 'var(--text-dim)' }}>#{u.id}</td>
                             <td style={{ padding: '10px 14px', fontWeight: 600 }}>
                               {u.username}
                               {isSelf && (
                                 <span style={{
                                   marginRight: 8,
-                                  background: '#0369a1',
-                                  color: '#e0f2fe',
+                                  background: 'var(--primary)',
+                                  color: '#fff',
                                   fontSize: 10,
                                   padding: '2px 6px',
                                   borderRadius: 4
@@ -871,8 +1123,9 @@ export default function SettingsPage() {
                             </td>
                             <td style={{ padding: '10px 14px' }}>
                               <span style={{
-                                background: u.role === 'admin' ? '#064e3b' : '#312e81',
-                                color: u.role === 'admin' ? '#34d399' : '#a5b4fc',
+                                background: u.role === 'admin' ? 'var(--badge-ready-bg)' : 'var(--primary-bg)',
+                                color: u.role === 'admin' ? 'var(--badge-ready-text)' : 'var(--primary)',
+                                border: u.role === 'admin' ? '1px solid var(--badge-ready-border)' : '1px solid var(--primary-border)',
                                 fontSize: 11,
                                 fontWeight: 700,
                                 padding: '2px 8px',
@@ -881,7 +1134,7 @@ export default function SettingsPage() {
                                 {u.role === 'admin' ? '🛡️ مدير نظام' : '👤 مشرف'}
                               </span>
                             </td>
-                            <td style={{ padding: '10px 14px', color: '#94a3b8', fontSize: 12 }}>
+                            <td style={{ padding: '10px 14px', color: 'var(--text-muted)', fontSize: 12 }}>
                               {u.created_at ? new Date(u.created_at).toLocaleDateString('ar-EG') : 'افتراضي'}
                             </td>
                             <td style={{ padding: '10px 14px', textAlign: 'center' }}>
@@ -890,9 +1143,9 @@ export default function SettingsPage() {
                                   type="button"
                                   onClick={() => handleDeleteUser(u.id, u.username)}
                                   style={{
-                                    background: '#ef444422',
-                                    border: '1px solid #ef444444',
-                                    color: '#f87171',
+                                    background: 'var(--badge-capped-bg)',
+                                    border: '1px solid var(--badge-capped-border)',
+                                    color: 'var(--badge-capped-text)',
                                     borderRadius: 6,
                                     padding: '4px 10px',
                                     fontSize: 11,
@@ -915,8 +1168,8 @@ export default function SettingsPage() {
                 <form
                   onSubmit={handleCreateUser}
                   style={{
-                    background: '#0f172a',
-                    border: '1px solid #334155',
+                    background: 'var(--bg-surface-elevated)',
+                    border: '1px solid var(--border-subtle)',
                     borderRadius: 10,
                     padding: 16,
                     display: 'flex',
@@ -926,7 +1179,7 @@ export default function SettingsPage() {
                   }}
                 >
                   <div style={{ flex: '1 1 180px' }}>
-                    <label style={{ display: 'block', fontSize: 12, fontWeight: 700, color: '#cbd5e1', marginBottom: 4 }}>
+                    <label style={{ display: 'block', fontSize: 12, fontWeight: 700, color: 'var(--text-main)', marginBottom: 4 }}>
                       اسم المستخدم الجديد
                     </label>
                     <input
@@ -938,10 +1191,10 @@ export default function SettingsPage() {
                       style={{
                         width: '100%',
                         padding: '8px 12px',
-                        background: '#1e293b',
-                        border: '1px solid #334155',
+                        background: 'var(--bg-input)',
+                        border: '1px solid var(--border-subtle)',
                         borderRadius: 6,
-                        color: '#f8fafc',
+                        color: 'var(--text-main)',
                         fontSize: 13,
                         outline: 'none'
                       }}
@@ -949,7 +1202,7 @@ export default function SettingsPage() {
                   </div>
 
                   <div style={{ flex: '1 1 180px' }}>
-                    <label style={{ display: 'block', fontSize: 12, fontWeight: 700, color: '#cbd5e1', marginBottom: 4 }}>
+                    <label style={{ display: 'block', fontSize: 12, fontWeight: 700, color: 'var(--text-main)', marginBottom: 4 }}>
                       كلمة المرور
                     </label>
                     <input
@@ -961,10 +1214,10 @@ export default function SettingsPage() {
                       style={{
                         width: '100%',
                         padding: '8px 12px',
-                        background: '#1e293b',
-                        border: '1px solid #334155',
+                        background: 'var(--bg-input)',
+                        border: '1px solid var(--border-subtle)',
                         borderRadius: 6,
-                        color: '#f8fafc',
+                        color: 'var(--text-main)',
                         fontSize: 13,
                         outline: 'none'
                       }}
@@ -972,7 +1225,7 @@ export default function SettingsPage() {
                   </div>
 
                   <div style={{ flex: '0 0 140px' }}>
-                    <label style={{ display: 'block', fontSize: 12, fontWeight: 700, color: '#cbd5e1', marginBottom: 4 }}>
+                    <label style={{ display: 'block', fontSize: 12, fontWeight: 700, color: 'var(--text-main)', marginBottom: 4 }}>
                       الصلاحية
                     </label>
                     <select
@@ -981,10 +1234,10 @@ export default function SettingsPage() {
                       style={{
                         width: '100%',
                         padding: '8px 12px',
-                        background: '#1e293b',
-                        border: '1px solid #334155',
+                        background: 'var(--bg-input)',
+                        border: '1px solid var(--border-subtle)',
                         borderRadius: 6,
-                        color: '#f8fafc',
+                        color: 'var(--text-main)',
                         fontSize: 13,
                         outline: 'none'
                       }}

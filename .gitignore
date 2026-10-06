@@ -43,3 +43,8 @@ Chatwoot_System_All_Code_Combined.txt
 credentials.json
 *.backup
 Backend/credentials.json
+Chatwoot_Router_v2.5_October_2026/
+scratch/
+Backend/check_cids_status.py
+Backend/check_data5.py
+cloudflared.exe

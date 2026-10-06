@@ -81,6 +81,73 @@ export default function ReportsPage() {
     }
   };
 
+  // Copy Executive Report to Clipboard (WhatsApp / Management)
+  const handleCopyReport = () => {
+    if (!report) return;
+    const s = report.summary || {};
+    const pending = report.pending_chats || [];
+    const agents = report.agents_summary || [];
+
+    // Filter agents with pending chats
+    const delayedAgents = agents.filter(a => (a.pending_count || 0) > 0).slice(0, 10);
+    // Filter critical chats
+    const criticalChats = pending.filter(c => c.severity === 'critical').slice(0, 10);
+
+    let text = `📊 *تقرير تأخيرات الرد ومراقبة الأداء*\n`;
+    text += `🕒 *الوقت:* ${s.timestamp || ''}\n`;
+    text += `🔍 *نطاق الفحص:* فحص ${s.total_scanned_chats || 0} محادثة مفتوحة\n`;
+    text += `━━━━━━━━━━━━━━━━━━━━\n`;
+    text += `⚡ *الملخص العام:*\n`;
+    text += `💬 إجمالي الشاتات المعلقة: *${s.total_pending_chats || 0}* محادثة\n`;
+    text += `🚨 تأخير حرج (15+ دقيقة): *${s.critical_count || 0}*\n`;
+    text += `⏳ تحذير تأخير (5-14 دقيقة): *${s.warning_count || 0}*\n`;
+    text += `🟢 تأخير طبيعي (<5 دقيقة): *${s.normal_count || 0}*\n`;
+    text += `🏃 أطول مدة انتظار: *${s.longest_delay_formatted || '0 د'}* (${s.most_delayed_agent || 'لا يوجد'})\n`;
+
+    if (delayedAgents.length > 0) {
+      text += `━━━━━━━━━━━━━━━━━━━━\n`;
+      text += `👥 *الموظفون الأكثر تأخراً في الرد:*\n`;
+      delayedAgents.forEach((a, i) => {
+        const flag = a.critical_count > 0 ? '🚨' : '⏳';
+        text += `${i + 1}. *${a.agent_name}* (${a.team}) | ${a.pending_count} معلق | أقصى تأخير: ${a.max_delay_text} ${flag}\n`;
+      });
+    }
+
+    if (criticalChats.length > 0) {
+      text += `━━━━━━━━━━━━━━━━━━━━\n`;
+      text += `🚨 *الشاتات الأكثر حرجاً (15+ دقيقة):*\n`;
+      criticalChats.forEach(c => {
+        const phone = c.customer_phone ? ` (${c.customer_phone})` : '';
+        text += `• #${c.conv_id} | ${c.agent_name} | عميل: ${c.customer_name}${phone} | انتظار: ${c.waiting_since_text}\n`;
+      });
+    }
+
+    text += `━━━━━━━━━━━━━━━━━━━━\n`;
+    text += `💡 تم الاستخراج آلياً عبر نظام التوزيع والمراقبة`;
+
+    const copyFallback = () => {
+      try {
+        const textArea = document.createElement('textarea');
+        textArea.value = text;
+        document.body.appendChild(textArea);
+        textArea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textArea);
+        showNotification('📋 تم نسخ التقرير بنجاح! جاهز للصق في واتساب أو أي مكان', 'success');
+      } catch (e) {
+        showNotification('تعذر النسخ التلقائي', 'error');
+      }
+    };
+
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(() => {
+        showNotification('📋 تم نسخ التقرير بنجاح! جاهز للصق في واتساب أو أي مكان', 'success');
+      }).catch(copyFallback);
+    } else {
+      copyFallback();
+    }
+  };
+
   // Filtered Pending Chats
   const filteredChats = useMemo(() => {
     if (!report || !report.pending_chats) return [];
@@ -211,12 +278,39 @@ export default function ReportsPage() {
                 cursor: 'pointer'
               }}
             >
-              <option value={4} style={{ background: C.bgLight, color: C.text }}>100 شات (4 صفحات)</option>
-              <option value={6} style={{ background: C.bgLight, color: C.text }}>150 شات (6 صفحات - موصى به)</option>
-              <option value={8} style={{ background: C.bgLight, color: C.text }}>200 شات (8 صفحات)</option>
+              <option value={6} style={{ background: C.bgLight, color: C.text }}>150 شات (6 صفحات - سريع)</option>
               <option value={12} style={{ background: C.bgLight, color: C.text }}>300 شات (12 صفحة)</option>
+              <option value={24} style={{ background: C.bgLight, color: C.text }}>600 شات (24 صفحة)</option>
+              <option value={48} style={{ background: C.bgLight, color: C.text }}>1200 شات (48 صفحة)</option>
+              <option value={75} style={{ background: C.bgLight, color: C.text }}>🌟 شاتات اليوم كله (حتى 1800+ شات)</option>
             </select>
           </div>
+
+          {/* Copy Report for WhatsApp / Management */}
+          <button
+            onClick={handleCopyReport}
+            disabled={!report || loading || refreshing}
+            className="btn btn-ghost"
+            style={{
+              background: 'rgba(56,189,248,0.12)',
+              color: C.accent,
+              border: `1px solid ${C.accentBorder}`,
+              fontWeight: 700,
+              fontSize: 13,
+              padding: '7px 16px',
+              borderRadius: 10,
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+              cursor: (!report || loading || refreshing) ? 'not-allowed' : 'pointer',
+              transition: 'all 0.2s ease',
+              opacity: (!report || loading || refreshing) ? 0.6 : 1
+            }}
+            title="نسخ تقرير نصي شامل ومنظم للمشاركة على واتساب أو إرساله للمشرفين"
+          >
+            <span style={{ fontSize: 16 }}>📋</span>
+            <span>نسخ تقرير (واتساب/إدارة)</span>
+          </button>
 
           {/* Auto Refresh Toggle */}
           <label style={{

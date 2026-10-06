@@ -4,6 +4,7 @@
 
 import requests
 import json
+import re
 import time
 import logging
 import os
@@ -803,6 +804,27 @@ def api_get_agents():
         ag["in_grace_period"] = in_grace
         ag["can_receive_now"] = _agent_has_valid_shift(ag)
         ag["current_hour"] = now.hour
+
+        # Compute real-time window timing details (من كام لكام ومتبقي كام دقيقة)
+        w_start_str = ag.get("window_start_time")
+        curr_win = ag.get("current_window_chats", 0)
+        if w_start_str and curr_win > 0:
+            try:
+                w_start = datetime.fromisoformat(w_start_str)
+                w_end = w_start + timedelta(minutes=window_minutes)
+                rem_sec = max(0, int((w_end - now).total_seconds()))
+                ag["window_start_time"] = w_start.isoformat()
+                ag["window_end_time"] = w_end.isoformat()
+                ag["window_remaining_seconds"] = rem_sec
+                ag["window_remaining_minutes"] = max(1, (rem_sec + 59) // 60) if rem_sec > 0 else 0
+            except Exception:
+                ag["window_end_time"] = None
+                ag["window_remaining_seconds"] = 0
+                ag["window_remaining_minutes"] = 0
+        else:
+            ag["window_end_time"] = None
+            ag["window_remaining_seconds"] = 0
+            ag["window_remaining_minutes"] = 0
         
         daily_lim = ag.get("daily_chat_limit")
         if daily_lim is None:
@@ -1169,8 +1191,8 @@ def _build_delays_report(num_pages=6):
 
     t0 = time.time()
     all_convs = []
-    num_pages = max(1, min(num_pages, 12))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(num_pages, 8)) as executor:
+    num_pages = max(1, min(num_pages, 80))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(num_pages, 16)) as executor:
         results = executor.map(_fetch_page, range(1, num_pages + 1))
         for page_convs in results:
             all_convs.extend(page_convs)
@@ -1329,14 +1351,15 @@ def api_reports_delays():
         
     now = time.time()
     with delays_cache_lock:
-        if not refresh and delays_cache["data"] is not None:
-            if now - delays_cache["cached_at"] < 20:  # 20 seconds TTL
+        if not refresh and delays_cache.get("data") is not None:
+            if delays_cache.get("pages") == pages and (now - delays_cache.get("cached_at", 0) < 20):  # 20 seconds TTL
                 return jsonify(delays_cache["data"])
                 
     report_data = _build_delays_report(num_pages=pages)
     with delays_cache_lock:
         delays_cache["data"] = report_data
         delays_cache["cached_at"] = now
+        delays_cache["pages"] = pages
         
     return jsonify(report_data)
 
@@ -1694,6 +1717,617 @@ def chatwoot_webhook():
         logger.error(f"❌ Webhook handling error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
+# ── Resolve & Quality Audit Engine ──────────────────────────────────────────
+
+_resolve_audit_cache = {}
+_resolve_audit_lock = threading.Lock()
+
+def classify_resolved_chat(first_reply, last_non_activity_msg):
+    """
+    Intelligently classifies a resolved chat into:
+    1. no_reply: Agent never replied (Critical violation)
+    2. unanswered_inquiry: Client asked a question or sent a sales inquiry (Violation)
+    3. unanswered_client: Last message from client was unanswered (Violation)
+    4. natural_closing: Client sent courtesy closing phrase like 'تمام شكرا' (Compliant / Exempt)
+    5. agent_replied: Agent was the last speaker (Compliant)
+    """
+    if not first_reply:
+        return 'no_reply', '🚨 لم يتم الرد نهائياً على العميل وتم إغلاق الشات', True
+
+    if not last_non_activity_msg:
+        return 'no_reply', '🚨 لا توجد رسائل مسجلة في الشات وتم إغلاقه', True
+
+    msg_type = last_non_activity_msg.get('message_type')
+    content = (last_non_activity_msg.get('content') or '').strip()
+
+    if msg_type == 1:
+        return 'agent_replied', '✅ تم الرد والإغلاق بنجاح (آخر رسالة من الموظف)', False
+
+    # Customer was the last speaker (msg_type == 0)
+    text_clean = re.sub(r'[^\w\s]', ' ', content).strip().lower()
+    
+    closing_phrases = [
+        'تمام شكرا', 'شكرا تمام', 'شكرا جدا', 'الف شكر', 'تسلم', 'تسلمي', 'تسلم يا غالي',
+        'تسلم ايدك', 'تسلم يا باشا', 'شكرا يا فندم', 'شكرا ليك', 'شكرا ليكي', 'شكرا جزيلا',
+        'شكرا لحضرتك', 'تمام يا فندم', 'تمام ماشي', 'ماشي تمام', 'خلاص تمام', 'اوك تمام',
+        'تمام اوك', 'اوكي تمام', 'اوكيه', 'اوكي', 'اوك', 'ok', 'thanks', 'thank you', 'thx',
+        'جزاك الله خيرا', 'ربنا يخليك', 'ربنا يباركلك', 'تمام فهمت', 'فهمت خلاص', 'كده تمام',
+        'كدا تمام', 'تمام كدة', 'تمام كده', 'لا شكرا', 'مش محتاج حاجه', 'مش محتاج حاجة',
+        'مفيش مشكلة', 'ولا يهمك', 'حبيبي تسلم', 'عفوا', 'سلام', 'مع السلامة', 'باي', 'bye',
+        'تمام', 'ماشي', 'خلاص'
+    ]
+
+    inquiry_indicators = [
+        '؟', '?', 'بكام', 'كام', 'سعر', 'اسعار', 'اشتراك', 'اشترك', 'باقة', 'باقات',
+        'عرض', 'عروض', 'خصم', 'تخفيض', 'تفاصيل', 'ازاي', 'كيف', 'طريقة', 'ادفع', 'دفع',
+        'فودافون كاش', 'فودافون', 'انستا باي', 'انستاباي', 'كود', 'رقم', 'لينك', 'رابط',
+        'تسجيل', 'سنتر', 'منصة', 'حجز', 'احجز', 'ليه', 'امتى', 'متى', 'فين', 'ممكن',
+        'ينفع', 'رد', 'حد يرد', 'انتوا فين'
+    ]
+
+    has_inquiry = any(ind in content.lower() for ind in inquiry_indicators)
+
+    is_closing = False
+    for cp in closing_phrases:
+        if text_clean == cp or (len(text_clean) <= len(cp) + 8 and cp in text_clean):
+            is_closing = True
+            break
+
+    # If inquiry exists and it's not a tiny courtesy message
+    if has_inquiry and not (is_closing and len(text_clean) <= 12):
+        return 'unanswered_inquiry', f'⚠️ سؤال معلق لم يُرد عليه: "{content[:60]}"', True
+
+    if is_closing:
+        return 'natural_closing', f'💬 إغلاق طبيعي (رسالة شكر/تأكيد: "{content[:40]}")', False
+
+    return 'unanswered_client', f'⚠️ آخر رسالة من العميل بدون رد: "{content[:60]}"', True
+
+def check_if_resolved_after_shift(resolved_at_dt, shift_start, shift_end, threshold_hours=1.0):
+    """
+    Checks if a conversation was resolved significantly after the agent's shift ended.
+    threshold_hours: how many hours after shift_end to consider 'significantly after' (default 1.0 hour).
+    Returns: (is_after_shift, hours_diff, description)
+    """
+    if not resolved_at_dt or shift_start is None or shift_end is None:
+        return False, 0.0, ""
+    
+    res_hour = resolved_at_dt.hour + (resolved_at_dt.minute / 60.0)
+    
+    # Same-day shift, e.g. 10 to 18 (10 AM to 6 PM)
+    if shift_start < shift_end:
+        if res_hour >= shift_end:
+            diff = res_hour - shift_end
+            if diff >= threshold_hours:
+                return True, round(diff, 1), f"بعد الشيفت بـ {round(diff, 1)} ساعة"
+        elif res_hour < shift_start:
+            diff = (24 - shift_end) + res_hour
+            if diff >= threshold_hours:
+                return True, round(diff, 1), f"بعد الشيفت بـ {round(diff, 1)} ساعة"
+    # Overnight shift, e.g. 18 to 2 (6 PM to 2 AM)
+    elif shift_start > shift_end:
+        if shift_end <= res_hour < shift_start:
+            diff = res_hour - shift_end
+            if diff >= threshold_hours:
+                return True, round(diff, 1), f"بعد الشيفت بـ {round(diff, 1)} ساعة"
+                
+    return False, 0.0, ""
+
+def fetch_cw_agent_reports_for_range(ts_start, ts_end, agent_ids):
+    """Fetches official Chatwoot reporting summary for all agents in the date range."""
+    cw_reports = {}
+    base_url, token, account_id = get_cw_config()
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
+    session.mount('https://', adapter)
+    session.headers.update(_cw_headers())
+    
+    def _fetch_one(ag_id):
+        url = f"{base_url}/api/v2/accounts/{account_id}/reports/summary?type=agent&since={ts_start}&until={ts_end}&id={ag_id}"
+        try:
+            r = session.get(url, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                return ag_id, data.get('conversations_count', 0), data.get('resolutions_count', 0)
+        except Exception:
+            pass
+        return ag_id, 0, 0
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        results = executor.map(_fetch_one, agent_ids)
+        for ag_id, conv_cnt, res_cnt in results:
+            cw_reports[ag_id] = {"conversations_count": conv_cnt, "resolutions_count": res_cnt}
+    return cw_reports
+
+def fetch_conversations_from_chatwoot_direct(date_start, date_end=None, target_agent_id=None, max_pages=200):
+    dt_start = CAIRO_TZ.localize(datetime.strptime(date_start, '%Y-%m-%d'))
+    end_date_str = date_end or date_start
+    dt_end = CAIRO_TZ.localize(datetime.strptime(end_date_str, '%Y-%m-%d')) + timedelta(days=1)
+    ts_start = int(dt_start.timestamp())
+    ts_end = int(dt_end.timestamp())
+
+    # Get known sales agents from DB
+    all_db_agents = database.get_all_agents()
+    sales_agent_map = {str(a['id']): a['name'] for a in all_db_agents}
+
+    base_url, token, account_id = get_cw_config()
+    headers = _cw_headers()
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(pool_connections=25, pool_maxsize=25, max_retries=2)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update(headers)
+
+    matched_convs = []
+    seen_cids = set()
+
+    def fetch_page(p):
+        for attempt in range(2):
+            try:
+                r = session.get(f"{base_url}/api/v1/accounts/{account_id}/conversations?status=resolved&page={p}", timeout=14)
+                if r.status_code == 200:
+                    return p, r.json().get('data', {}).get('payload', [])
+            except Exception as e:
+                if attempt == 1:
+                    logger.warning(f"⚠️ Error fetching Chatwoot resolved page {p}: {e}")
+                time.sleep(0.2)
+        return p, []
+
+    chunk_size = 10
+    current_page = 1
+    stop = False
+
+    while current_page <= max_pages and not stop:
+        page_chunk = list(range(current_page, current_page + chunk_size))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=chunk_size) as ex:
+            futures = [ex.submit(fetch_page, p) for p in page_chunk]
+            results = [f.result() for f in futures]
+
+        results.sort(key=lambda x: x[0])
+
+        all_empty = True
+        for page_num, items in results:
+            if not items:
+                continue
+            all_empty = False
+
+            # Check if all items on this page are already older than target date start
+            page_acts = [c.get('last_activity_at') or c.get('updated_at') or c.get('created_at') for c in items]
+            page_acts = [a for a in page_acts if a]
+            if page_acts and max(page_acts) < ts_start:
+                stop = True
+                break
+
+            for c in items:
+                act = c.get('last_activity_at') or c.get('updated_at') or c.get('created_at')
+                if not act:
+                    continue
+
+                if act < ts_start:
+                    continue
+
+                if ts_start <= act < ts_end:
+                    cid = str(c.get('id'))
+                    if cid in seen_cids:
+                        continue
+                    seen_cids.add(cid)
+
+                    assignee = (c.get('meta', {}) or {}).get('assignee') or {}
+                    ag_id = str(assignee.get('id') or '')
+                    ag_name = assignee.get('name') or sales_agent_map.get(ag_id)
+
+                    if target_agent_id and ag_id != str(target_agent_id):
+                        continue
+
+                    # Filter to known sales agents if any exist, or include all agents
+                    if ag_id and (ag_id in sales_agent_map or not sales_agent_map):
+                        matched_convs.append((c, ag_id, ag_name or f"Agent #{ag_id}"))
+
+        if all_empty and current_page > 5:
+            break
+
+        current_page += chunk_size
+
+    return matched_convs
+
+def audit_conversations_for_agents(date_str=None, end_date_str=None, target_agent_id=None, source="chatwoot", force_refresh=False):
+    """
+    Audits conversations for all agents or a specific agent on a specific date or date range.
+    source='chatwoot' pulls directly from Chatwoot API (all handled conversations).
+    source='system' pulls from local SQLite chats_log (router-assigned conversations).
+    """
+    now_cairo = datetime.now(CAIRO_TZ)
+    if not date_str or date_str in ["today", "النهاردة", "اليوم"]:
+        date_str = now_cairo.strftime("%Y-%m-%d")
+    elif date_str in ["yesterday", "أمس", "امبارح"]:
+        date_str = (now_cairo - timedelta(days=1)).strftime("%Y-%m-%d")
+    elif date_str in ["2days", "last2days", "يومين", "يومان"]:
+        date_str = (now_cairo - timedelta(days=1)).strftime("%Y-%m-%d")
+        end_date_str = now_cairo.strftime("%Y-%m-%d")
+
+    if not end_date_str:
+        end_date_str = date_str
+
+    cache_key = f"{source}_{target_agent_id or 'ALL'}_{date_str}_{end_date_str}"
+    now_ts = time.time()
+    with _resolve_audit_lock:
+        cached = _resolve_audit_cache.get(cache_key)
+        if not force_refresh and cached and (now_ts - cached.get("timestamp", 0) < 900):
+            return cached.get("payload")
+
+    base_url, token, account_id = get_cw_config()
+    audited_chats = []
+
+    all_db_agents = database.get_all_agents()
+    db_agent_dict = {str(a['id']): a for a in all_db_agents}
+    open_counts = fetch_agent_report_counts()
+
+    # Time boundaries
+    dt_s = CAIRO_TZ.localize(datetime.strptime(date_str, '%Y-%m-%d'))
+    dt_e = CAIRO_TZ.localize(datetime.strptime(end_date_str, '%Y-%m-%d')) + timedelta(days=1)
+    ts_start = int(dt_s.timestamp())
+    ts_end = int(dt_e.timestamp())
+
+    if source == "chatwoot":
+        # Direct fetch from Chatwoot API
+        raw_matches = fetch_conversations_from_chatwoot_direct(date_str, date_end=end_date_str, target_agent_id=target_agent_id)
+        for c, ag_id, ag_name in raw_matches:
+            cid = str(c.get("id"))
+            st = c.get("status", "resolved")
+            fr = c.get("first_reply_created_at")
+            lnm = c.get("last_non_activity_message") or {}
+            meta = c.get("meta", {}) or {}
+            sender = meta.get("sender") or {}
+            s_name = sender.get("name") or ""
+            s_phone = sender.get("phone_number") or sender.get("identifier") or ""
+            last_content = (lnm.get("content") or "").strip()
+            last_sender_type = lnm.get("message_type")
+
+            cls_code, cls_desc, is_viol = classify_resolved_chat(fr, lnm)
+
+            act_ts = c.get("last_activity_at") or c.get("updated_at") or c.get("created_at")
+            act_dt = datetime.fromtimestamp(act_ts, CAIRO_TZ) if act_ts else None
+            act_dt_str = act_dt.isoformat() if act_dt else ""
+
+            # Check if resolved significantly after shift end
+            db_ag = db_agent_dict.get(ag_id, {})
+            shift_s = db_ag.get("shift_start")
+            shift_e = db_ag.get("shift_end")
+            is_after_s, diff_hours, desc_s = check_if_resolved_after_shift(act_dt, shift_s, shift_e)
+
+            labels_list = c.get("labels") or []
+            label_str = ", ".join(labels_list) if isinstance(labels_list, list) else str(labels_list)
+
+            coord_str = db_ag.get("coordinator_name") or db_ag.get("coordinator") or "—"
+            shift_display = db_ag.get("shift_text") or db_ag.get("shift") or "—"
+
+            audited_chats.append({
+                "conv_id": cid,
+                "agent_id": ag_id,
+                "agent_name": ag_name,
+                "coordinator": coord_str,
+                "shift": shift_display,
+                "label": label_str,
+                "assigned_at": act_dt_str,
+                "status": st,
+                "first_reply_created_at": fr,
+                "last_content": last_content,
+                "last_sender_type": last_sender_type,
+                "classification": cls_code,
+                "classification_label": cls_desc,
+                "is_violation": is_viol,
+                "is_after_shift": is_after_s,
+                "hours_after_shift": diff_hours,
+                "after_shift_desc": desc_s,
+                "resolved_time_str": act_dt.strftime("%I:%M %p") if act_dt else "",
+                "sender_name": s_name,
+                "sender_phone": s_phone,
+                "chatwoot_url": f"{base_url}/app/accounts/{account_id}/conversations/{cid}"
+            })
+    else:
+        # System-routed logs from local database
+        routed_chats = database.get_routed_chats_for_audit(date_str=date_str, end_date_str=end_date_str, agent_id=target_agent_id)
+        headers = _cw_headers()
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
+        session.mount("https://", adapter)
+        session.headers.update(headers)
+
+        def _inspect_one_chat(ch):
+            cid = ch.get("conv_id")
+            ag_id = str(ch.get("agent_id") or "")
+            ag_name = ch.get("agent_name") or "Unknown"
+            assigned_at = ch.get("assigned_at") or ""
+            label = ch.get("label") or ""
+
+            url = f"{base_url}/api/v1/accounts/{account_id}/conversations/{cid}"
+            try:
+                res = session.get(url, timeout=10)
+                if res.status_code == 200:
+                    data = res.json()
+                    st = data.get("status", "unknown")
+                    fr = data.get("first_reply_created_at")
+                    lnm = data.get("last_non_activity_message") or {}
+                    meta = data.get("meta", {}) or {}
+                    sender = meta.get("sender") or {}
+                    s_name = sender.get("name") or ch.get("sender_name") or ""
+                    s_phone = sender.get("phone_number") or sender.get("identifier") or ch.get("sender_phone") or ""
+
+                    last_content = (lnm.get("content") or "").strip()
+                    last_sender_type = lnm.get("message_type")
+
+                    if st == "resolved":
+                        cls_code, cls_desc, is_viol = classify_resolved_chat(fr, lnm)
+                    elif st == "open":
+                        cls_code, cls_desc, is_viol = "still_open", "🟢 قيد المتابعة (شات مفتوح)", False
+                    elif st == "pending":
+                        cls_code, cls_desc, is_viol = "pending", "⏳ شات معلق (Pending)", False
+                    else:
+                        cls_code, cls_desc, is_viol = st, f"حالة الشات: {st}", False
+
+                    act_ts = data.get("last_activity_at") or data.get("updated_at")
+                    act_dt = datetime.fromtimestamp(act_ts, CAIRO_TZ) if act_ts else None
+
+                    db_ag = db_agent_dict.get(ag_id, {})
+                    shift_s = db_ag.get("shift_start")
+                    shift_e = db_ag.get("shift_end")
+                    is_after_s, diff_hours, desc_s = check_if_resolved_after_shift(act_dt, shift_s, shift_e)
+
+                    coord_str = db_ag.get("coordinator_name") or db_ag.get("coordinator") or "—"
+                    shift_display = db_ag.get("shift_text") or db_ag.get("shift") or "—"
+
+                    return {
+                        "conv_id": cid,
+                        "agent_id": ag_id,
+                        "agent_name": ag_name,
+                        "coordinator": coord_str,
+                        "shift": shift_display,
+                        "label": label,
+                        "assigned_at": assigned_at,
+                        "status": st,
+                        "first_reply_created_at": fr,
+                        "last_content": last_content,
+                        "last_sender_type": last_sender_type,
+                        "classification": cls_code,
+                        "classification_label": cls_desc,
+                        "is_violation": is_viol,
+                        "is_after_shift": is_after_s,
+                        "hours_after_shift": diff_hours,
+                        "after_shift_desc": desc_s,
+                        "resolved_time_str": act_dt.strftime("%I:%M %p") if act_dt else "",
+                        "sender_name": s_name,
+                        "sender_phone": s_phone,
+                        "chatwoot_url": f"{base_url}/app/accounts/{account_id}/conversations/{cid}"
+                    }
+            except Exception as e:
+                logger.warning(f"⚠️ Error inspecting conv {cid}: {e}")
+
+            db_ag_fallback = db_agent_dict.get(ag_id, {})
+            return {
+                "conv_id": cid,
+                "agent_id": ag_id,
+                "agent_name": ag_name,
+                "coordinator": db_ag_fallback.get("coordinator_name") or db_ag_fallback.get("coordinator") or "—",
+                "shift": db_ag_fallback.get("shift_text") or db_ag_fallback.get("shift") or "—",
+                "label": label,
+                "assigned_at": assigned_at,
+                "status": "unknown",
+                "classification": "unknown",
+                "classification_label": "تعذر جلب حالة الشات",
+                "is_violation": False,
+                "is_after_shift": False,
+                "hours_after_shift": 0.0,
+                "after_shift_desc": "",
+                "resolved_time_str": "",
+                "sender_name": ch.get("sender_name") or "",
+                "sender_phone": ch.get("sender_phone") or "",
+                "chatwoot_url": f"{base_url}/app/accounts/{account_id}/conversations/{cid}"
+            }
+
+        max_workers = min(10, max(1, len(routed_chats)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_inspect_one_chat, ch) for ch in routed_chats]
+            for f in concurrent.futures.as_completed(futures):
+                res = f.result()
+                if res:
+                    audited_chats.append(res)
+
+    # Sort audited chats by assigned_at desc
+    audited_chats.sort(key=lambda c: c.get("assigned_at", ""), reverse=True)
+
+    # Group by Agent
+    all_db_agents = database.get_all_agents()
+    db_agent_dict = {str(a['id']): a for a in all_db_agents}
+    open_counts = fetch_agent_report_counts()
+
+    agents_map = {}
+    for ch in audited_chats:
+        ag_id = ch["agent_id"]
+        if ag_id not in agents_map:
+            db_ag = db_agent_dict.get(ag_id, {})
+            agents_map[ag_id] = {
+                "agent_id": ag_id,
+                "agent_name": ch["agent_name"],
+                "crm_name": db_ag.get("crm_name") or ch["agent_name"],
+                "coordinator": db_ag.get("coordinator_name") or db_ag.get("coordinator") or "—",
+                "shift": db_ag.get("shift_text") or db_ag.get("shift") or "—",
+                "shift_start": db_ag.get("shift_start"),
+                "shift_end": db_ag.get("shift_end"),
+                "team": db_ag.get("team") or "Sales",
+                "total_routed": 0,
+                "total_resolved": 0,
+                "total_open": 0,
+                "total_violations": 0,
+                "after_shift_resolves_count": 0,
+                "unanswered_inquiries_count": 0,
+                "no_reply_count": 0,
+                "natural_closing_count": 0,
+                "properly_resolved_count": 0,
+                "chats": []
+            }
+        ag = agents_map[ag_id]
+        ag["total_routed"] += 1
+        st = ch.get("status")
+        cls = ch.get("classification")
+        if st == "resolved":
+            ag["total_resolved"] += 1
+            if ch.get("is_after_shift"):
+                ag["after_shift_resolves_count"] += 1
+            if ch.get("is_violation"):
+                ag["total_violations"] += 1
+                if cls == "no_reply":
+                    ag["no_reply_count"] += 1
+                elif cls in ["unanswered_inquiry", "unanswered_client"]:
+                    ag["unanswered_inquiries_count"] += 1
+            else:
+                ag["properly_resolved_count"] += 1
+                if cls == "natural_closing":
+                    ag["natural_closing_count"] += 1
+        elif st == "open":
+            ag["total_open"] += 1
+
+        ag["chats"].append(ch)
+
+    # Also include sales agents who had 0 resolved chats
+    if not target_agent_id:
+        for db_ag in all_db_agents:
+            ag_id = str(db_ag['id'])
+            if db_ag.get('team') not in ['Sales', 'Data']:
+                continue
+            if ag_id not in agents_map:
+                open_cnt = open_counts.get(ag_id, 0)
+                agents_map[ag_id] = {
+                    "agent_id": ag_id,
+                    "agent_name": db_ag.get("name") or f"Agent #{ag_id}",
+                    "crm_name": db_ag.get("crm_name") or db_ag.get("name"),
+                    "coordinator": db_ag.get("coordinator_name") or db_ag.get("coordinator") or "—",
+                    "shift": db_ag.get("shift_text") or db_ag.get("shift") or "—",
+                    "shift_start": db_ag.get("shift_start"),
+                    "shift_end": db_ag.get("shift_end"),
+                    "team": db_ag.get("team") or "Sales",
+                    "total_routed": open_cnt,
+                    "total_resolved": 0,
+                    "total_open": open_cnt,
+                    "total_violations": 0,
+                    "after_shift_resolves_count": 0,
+                    "unanswered_inquiries_count": 0,
+                    "no_reply_count": 0,
+                    "natural_closing_count": 0,
+                    "properly_resolved_count": 0,
+                    "chats": []
+                }
+
+    # If source == "chatwoot": fetch official reporting metrics (conversations_count) from Chatwoot API
+    if source == "chatwoot" and agents_map:
+        try:
+            target_ids = list(agents_map.keys())
+            cw_reports = fetch_cw_agent_reports_for_range(ts_start, ts_end, target_ids)
+            for ag_id, ag in agents_map.items():
+                if ag["total_open"] == 0:
+                    ag["total_open"] = open_counts.get(ag_id, 0)
+                rep = cw_reports.get(ag_id)
+                if rep and rep.get("conversations_count", 0) > 0:
+                    ag["total_routed"] = rep["conversations_count"]
+                else:
+                    ag["total_routed"] = ag["total_resolved"] + ag["total_open"]
+                # Safety check
+                if ag["total_routed"] < ag["total_resolved"]:
+                    ag["total_routed"] = ag["total_resolved"] + ag["total_open"]
+        except Exception as e:
+            logger.warning(f"⚠️ fetch_cw_agent_reports_for_range error: {e}")
+            for ag_id, ag in agents_map.items():
+                if ag["total_open"] == 0:
+                    ag["total_open"] = open_counts.get(ag_id, 0)
+                ag["total_routed"] = ag["total_resolved"] + ag["total_open"]
+
+    # Compute rates for agents
+    agent_summaries = []
+    all_violations = []
+
+    for ag_id, ag in agents_map.items():
+        res_cnt = ag["total_resolved"]
+        tot_cnt = ag["total_routed"]
+        prop_cnt = ag["properly_resolved_count"]
+        ag["resolution_rate"] = round((res_cnt / tot_cnt * 100), 1) if tot_cnt > 0 else 0
+        ag["compliance_rate"] = round((prop_cnt / res_cnt * 100), 1) if res_cnt > 0 else 100
+        agent_summaries.append(ag)
+
+    # Sort agents: agents with violations or off-shift resolves first, then by total resolved desc
+    agent_summaries.sort(key=lambda a: (a["total_violations"], a["after_shift_resolves_count"], a["total_resolved"]), reverse=True)
+
+    # Collect all violation and after-shift chats across all audited agents
+    all_violations = []
+    all_after_shift = []
+    for ch in audited_chats:
+        if ch.get("is_violation"):
+            all_violations.append(ch)
+        if ch.get("is_after_shift"):
+            all_after_shift.append(ch)
+
+    total_routed = sum(a["total_routed"] for a in agent_summaries)
+    total_resolved = sum(a["total_resolved"] for a in agent_summaries)
+    total_open = sum(a["total_open"] for a in agent_summaries)
+    total_violations = sum(a["total_violations"] for a in agent_summaries)
+    total_after_shift = sum(a["after_shift_resolves_count"] for a in agent_summaries)
+    total_inquiries = sum(a["unanswered_inquiries_count"] for a in agent_summaries)
+    total_no_reply = sum(a["no_reply_count"] for a in agent_summaries)
+    total_compliant = sum(a["properly_resolved_count"] for a in agent_summaries)
+
+    is_range = (date_str != end_date_str)
+    date_display = f"{date_str} إلى {end_date_str}" if is_range else date_str
+
+    payload = {
+        "summary": {
+            "date": date_display,
+            "date_start": date_str,
+            "date_end": end_date_str,
+            "is_range": is_range,
+            "source": source,
+            "total_routed": total_routed,
+            "total_resolved": total_resolved,
+            "total_open": total_open,
+            "total_violations": total_violations,
+            "total_after_shift_resolves": total_after_shift,
+            "total_unanswered_inquiries": total_inquiries,
+            "total_no_reply": total_no_reply,
+            "total_compliant": total_compliant,
+            "resolution_rate": round((total_resolved / total_routed * 100), 1) if total_routed > 0 else 0,
+            "compliance_rate": round((total_compliant / total_resolved * 100), 1) if total_resolved > 0 else 100,
+            "audited_at": datetime.now(CAIRO_TZ).strftime("%I:%M %p")
+        },
+        "agents": agent_summaries,
+        "all_violations": all_violations,
+        "all_after_shift": all_after_shift
+    }
+
+    with _resolve_audit_lock:
+        _resolve_audit_cache[cache_key] = {"timestamp": now_ts, "payload": payload}
+
+    return payload
+
+@app.route('/api/reports/resolve-audit', methods=['GET', 'POST'])
+def api_resolve_audit():
+    req_json = request.get_json(silent=True) or {}
+    agent_id = request.args.get("agent_id") or req_json.get("agent_id")
+    date_str = request.args.get("date") or request.args.get("date_start") or request.args.get("startDate") or req_json.get("date") or req_json.get("date_start") or req_json.get("startDate")
+    end_date_str = request.args.get("date_end") or request.args.get("endDate") or req_json.get("date_end") or req_json.get("endDate")
+    source = request.args.get("source") or req_json.get("source") or "chatwoot"
+    force_refresh = str(request.args.get("force_refresh", "")).lower() in ["true", "1", "yes"]
+    if not force_refresh:
+        force_refresh = bool(req_json.get("force_refresh", False))
+
+    try:
+        data = audit_conversations_for_agents(
+            date_str=date_str,
+            end_date_str=end_date_str,
+            target_agent_id=agent_id,
+            source=source,
+            force_refresh=force_refresh
+        )
+        return jsonify({"success": True, "data": data})
+    except Exception as e:
+        logger.error(f"❌ api_resolve_audit error: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
 # Serve Frontend static files
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
@@ -1715,7 +2349,7 @@ _single_instance_socket = None
 def _enforce_single_instance():
     """Prevents multiple instances of app.py from running concurrently."""
     global _single_instance_socket
-    if os.environ.get('RENDER'):
+    if os.environ.get('RENDER') or os.environ.get('SPACE_ID') or os.environ.get('HF_SPACE_ID') or os.environ.get('PORT'):
         return
     import socket
     _single_instance_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

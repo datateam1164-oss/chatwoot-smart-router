@@ -441,24 +441,22 @@ def _run_single_routing_cycle():
 
         unassigned.sort(key=_get_conv_sort_key)
 
-        pulled_today = database.get_pulled_conversation_ids_today()
-        assigned_today = database.get_assigned_conversation_ids_today()
-
         now_ts = time.time()
         with assigned_lock:
-            expired = [k for k, ts in recently_assigned_convs.items() if now_ts - ts > 14400]
+            # 120 seconds TTL is sufficient to protect against Chatwoot unassigned API lag / race conditions
+            expired = [k for k, ts in recently_assigned_convs.items() if now_ts - ts > 120]
             for k in expired:
                 del recently_assigned_convs[k]
 
         routed = 0
         for conv in unassigned:
             cid = str(conv["id"])
-            # Pulled chats in unassigned queue are now allowed to be distributed normally per user request
 
-            if cid in assigned_today or cid in recently_assigned_convs or database.is_conversation_assigned_today(cid):
-                # Chat was ALREADY assigned today: Chatwoot listing API may have lag in updating unassigned filter.
-                # Skip duplicate routing to prevent reassigning within seconds/minutes!
-                continue
+            # Anti-race condition / API lag guard:
+            # If this conversation was assigned by the router within the last 120 seconds, skip to let Chatwoot API catch up
+            with assigned_lock:
+                if cid in recently_assigned_convs:
+                    continue
 
             with conv_lock:
                 if cid in processing_convs: continue
@@ -491,16 +489,24 @@ def _run_single_routing_cycle():
                     continue
 
                 best_agent = eligible[0]
+
+                # If this chat was unassigned / pulled and previously assigned today, try to pick another eligible agent
+                prev_agent_id = database.get_last_assigned_agent_for_conv(cid)
+                if prev_agent_id and len(eligible) > 1:
+                    other_agents = [ag for ag in eligible if str(ag["id"]) != str(prev_agent_id)]
+                    if other_agents:
+                        best_agent = other_agents[0]
+
                 curr_chats = best_agent.get("current_window_chats", 0)
                 lim_chats = best_agent.get("chat_limit", 10)
                 if curr_chats >= lim_chats:
                     logger.warning(f"⚠️ Agent {best_agent['name']} already at limit ({curr_chats}/{lim_chats}). Skipping.")
                     continue
 
-                # Final guard: Check DB immediately before assigning in Chatwoot
-                if database.is_conversation_assigned_today(cid):
-                    logger.info(f"⏭️ Skipping conv {cid} - already assigned today in DB.")
-                    continue
+                # Final guard: verify not in recently_assigned_convs
+                with assigned_lock:
+                    if cid in recently_assigned_convs:
+                        continue
 
                 logger.info(f"🎯 Routing Conv {cid} ({matched_label}) -> Agent: {best_agent['name']} ({curr_chats}/{lim_chats})")
 
@@ -515,7 +521,6 @@ def _run_single_routing_cycle():
                         sender_name=conv.get("sender_name", ""),
                         last_message=conv.get("last_message", "")
                     )
-                    assigned_today.add(cid)
                     with assigned_lock:
                         recently_assigned_convs[cid] = time.time()
                     routed += 1

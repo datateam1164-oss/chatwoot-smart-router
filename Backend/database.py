@@ -502,6 +502,26 @@ def is_conversation_assigned_today(conv_id):
     conn.close()
     return row is not None
 
+def get_last_assigned_agent_for_conv(conv_id):
+    """Returns the agent_id to whom this conv_id was most recently assigned today, if any."""
+    if not conv_id:
+        return None
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+        today_prefix = datetime.now(CAIRO_TZ).strftime("%Y-%m-%d")
+        cursor.execute("""
+            SELECT agent_id FROM chats_log 
+            WHERE conv_id = ? AND assigned_at LIKE ? AND status = 'assigned'
+            ORDER BY id DESC LIMIT 1
+        """, (str(conv_id), f"{today_prefix}%"))
+        row = cursor.fetchone()
+        conn.close()
+        return str(row[0]) if row else None
+    except Exception as e:
+        logger.error(f"Error getting last assigned agent for {conv_id}: {e}")
+        return None
+
 def decrement_agent_window_chats(agent_id, count=1):
     conn = get_db()
     cursor = conn.cursor()

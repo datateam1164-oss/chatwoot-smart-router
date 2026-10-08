@@ -1444,6 +1444,9 @@ def api_mappings():
         mappings = database.get_all_mappings()
         return jsonify({"success": True, "mappings": mappings})
 
+_cw_labels_cache = {"labels": [], "timestamp": 0}
+_cw_labels_lock = threading.Lock()
+
 @app.route('/api/labels', methods=['GET', 'POST'])
 def api_labels():
     if request.method == 'POST':
@@ -1452,27 +1455,47 @@ def api_labels():
         if not isinstance(labels, list):
             return jsonify({"success": False, "error": "Labels must be a list"}), 400
         database.set_setting("valid_labels_order", json.dumps(labels))
+        with _cw_labels_lock:
+            _cw_labels_cache["timestamp"] = 0  # Invalidate on save
         return jsonify({"success": True, "message": "تم حفظ تصنيفات السيلز بنجاح", "labels": labels})
     else:
-        # Fetch all available labels from Chatwoot API
-        base_url, token, account_id = get_cw_config()
-        url = f"{base_url}/api/v1/accounts/{account_id}/labels"
+        # Check cache (valid for 5 minutes / 300 seconds)
+        force_refresh = request.args.get("refresh") == "true"
+        now = time.time()
         cw_labels = []
-        try:
-            res = requests.get(url, headers=_cw_headers(), timeout=10)
-            if res.status_code == 200:
-                raw_data = res.json()
-                items = raw_data.get("payload", []) if isinstance(raw_data, dict) else raw_data
-                for item in items:
-                    if isinstance(item, dict) and item.get("title"):
-                        cw_labels.append({
-                            "id": item.get("id"),
-                            "title": item.get("title"),
-                            "description": item.get("description", ""),
-                            "color": item.get("color", "#3b82f6")
-                        })
-        except Exception as e:
-            logger.error(f"❌ Error fetching Chatwoot labels: {e}")
+
+        with _cw_labels_lock:
+            if not force_refresh and _cw_labels_cache["labels"] and (now - _cw_labels_cache["timestamp"] < 300):
+                cw_labels = _cw_labels_cache["labels"]
+
+        if not cw_labels:
+            # Fetch available labels from Chatwoot API
+            base_url, token, account_id = get_cw_config()
+            url = f"{base_url}/api/v1/accounts/{account_id}/labels"
+            try:
+                res = requests.get(url, headers=_cw_headers(), timeout=12)
+                if res.status_code == 200:
+                    raw_data = res.json()
+                    items = raw_data.get("payload", []) if isinstance(raw_data, dict) else raw_data
+                    fetched = []
+                    for item in items:
+                        if isinstance(item, dict) and item.get("title"):
+                            fetched.append({
+                                "id": item.get("id"),
+                                "title": item.get("title"),
+                                "description": item.get("description", ""),
+                                "color": item.get("color", "#3b82f6")
+                            })
+                    if fetched:
+                        cw_labels = fetched
+                        with _cw_labels_lock:
+                            _cw_labels_cache["labels"] = cw_labels
+                            _cw_labels_cache["timestamp"] = now
+            except Exception as e:
+                logger.warning(f"⚠️ Error fetching Chatwoot labels (using cached if available): {e}")
+                with _cw_labels_lock:
+                    if _cw_labels_cache["labels"]:
+                        cw_labels = _cw_labels_cache["labels"]
 
         settings = database.get_settings()
         selected_labels = json.loads(settings.get("valid_labels_order", "[]"))

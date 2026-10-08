@@ -2373,8 +2373,9 @@ if __name__ == '__main__':
     _enforce_single_instance()
     logger.info("🚀 Initializing Chatwoot Smart Router...")
     database.init_db()
-    # Safety: Start with routing STOPPED until supervisor clicks Start in Dashboard
-    set_routing_enabled(False)
+    # Preserve routing state from settings (keep running if it was already active)
+    saved_enabled = is_routing_enabled()
+    set_routing_enabled(saved_enabled)
     
     # 1. Load initial agents and teams from Chatwoot
     _refresh_team_cache()

@@ -10,6 +10,7 @@ export default function AutoResolverPage() {
   const [labelMode, setLabelMode] = useState('all'); // 'all' | 'unlabeled' | 'specific'
   const [specificLabel, setSpecificLabel] = useState('');
   const [maxPages, setMaxPages] = useState(20);
+  const [sortOrder, setSortOrder] = useState('asc'); // 'asc' (Oldest first) | 'desc'
 
   // Available labels from Chatwoot
   const [availableLabels, setAvailableLabels] = useState([]);
@@ -87,8 +88,10 @@ export default function AutoResolverPage() {
         label_mode: labelMode,
         specific_label: specificLabel,
         hours_threshold: hoursThreshold,
-        max_pages: maxPages
+        max_pages: maxPages,
+        sort_order: sortOrder
       });
+
 
       setScanResult(data);
       // Default to select all matched IDs
@@ -430,7 +433,44 @@ export default function AutoResolverPage() {
               Higher pages allow discovering older archived chats across multiple pages.
             </div>
           </div>
+
+          {/* 5. Scan Strategy */}
+          <div>
+            <label style={{ display: 'block', fontSize: 13, fontWeight: 700, color: 'var(--text-muted)', marginBottom: 8 }}>
+              5. Scan Strategy (Sort Order)
+            </label>
+            <div style={{ display: 'flex', gap: 6 }}>
+              {[
+                { id: 'asc', label: '⏳ Oldest First (Stale Backlog)' },
+                { id: 'desc', label: '⚡ Newest First' }
+              ].map(opt => (
+                <button
+                  key={opt.id}
+                  type="button"
+                  onClick={() => setSortOrder(opt.id)}
+                  style={{
+                    flex: 1,
+                    padding: '9px 10px',
+                    borderRadius: 8,
+                    fontSize: 12,
+                    fontWeight: 700,
+                    cursor: 'pointer',
+                    transition: 'all 0.15s ease',
+                    border: sortOrder === opt.id ? '1px solid var(--primary)' : '1px solid var(--border-subtle)',
+                    background: sortOrder === opt.id ? 'var(--primary-bg)' : 'var(--bg-input)',
+                    color: sortOrder === opt.id ? 'var(--primary)' : 'var(--text-main)',
+                  }}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+            <div style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 6 }}>
+              "Oldest First" scans conversations starting from weeks and days ago, ideal for bot backlogs.
+            </div>
+          </div>
         </div>
+
 
         {/* Scan Submit Button */}
         <div style={{ marginTop: 20, paddingTop: 16, borderTop: '1px solid var(--border-subtle)', display: 'flex', justifyContent: 'flex-end', gap: 12 }}>

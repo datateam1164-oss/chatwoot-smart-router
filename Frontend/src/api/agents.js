@@ -478,7 +478,7 @@ export const agentsApi = {
 };
 
 export const autoResolverApi = {
-  async scan({ status = 'pending', label_mode = 'all', specific_label = '', hours_threshold = 48, max_pages = 20 } = {}) {
+  async scan({ status = 'pending', label_mode = 'all', specific_label = '', hours_threshold = 48, max_pages = 20, sort_order = 'asc' } = {}) {
     const res = await apiFetch('/auto-resolver/scan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -487,7 +487,8 @@ export const autoResolverApi = {
         label_mode,
         specific_label,
         hours_threshold: Number(hours_threshold),
-        max_pages: Number(max_pages)
+        max_pages: Number(max_pages),
+        sort_order
       })
     });
     const data = await res.json();

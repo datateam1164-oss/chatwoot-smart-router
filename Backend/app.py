@@ -1747,10 +1747,11 @@ def chatwoot_webhook():
 
 # ── Bulk Auto Resolver Engine ─────────────────────────────────────────────
 
-def _fetch_conversations_for_resolver(target_status="pending", max_pages=20):
+def _fetch_conversations_for_resolver(target_status="pending", max_pages=20, sort_order="asc"):
     """
     Fetches conversations across pages for the resolver engine.
     target_status can be 'pending', 'open', or 'both'.
+    sort_order: 'asc' (oldest first, recommended to find stale chats) or 'desc' (newest first).
     """
     base_url, token, account_id = get_cw_config()
     headers = _cw_headers()
@@ -1758,9 +1759,11 @@ def _fetch_conversations_for_resolver(target_status="pending", max_pages=20):
     statuses = ["pending"] if target_status == "pending" else (["open"] if target_status == "open" else ["pending", "open"])
     all_convs = []
 
+    sort_param = "last_activity_at_asc" if sort_order == "asc" else "last_activity_at_desc"
+
     def _fetch_page(st, page_num):
         url = f"{base_url}/api/v1/accounts/{account_id}/conversations"
-        params = {"status": st, "page": page_num}
+        params = {"status": st, "page": page_num, "sort_by": sort_param}
         try:
             r = requests.get(url, params=params, headers=headers, timeout=12)
             if r.status_code == 200:
@@ -1802,6 +1805,7 @@ def api_auto_resolver_scan():
     target_status = str(body.get("status", "pending")).strip().lower()
     label_mode = str(body.get("label_mode", "all")).strip().lower()
     specific_label = str(body.get("specific_label", "")).strip().lower()
+    sort_order = str(body.get("sort_order", "asc")).strip().lower()
 
     try:
         hours_threshold = float(body.get("hours_threshold", 48))
@@ -1814,7 +1818,8 @@ def api_auto_resolver_scan():
     except (ValueError, TypeError):
         max_pages = 20
 
-    raw_convs = _fetch_conversations_for_resolver(target_status=target_status, max_pages=max_pages)
+    raw_convs = _fetch_conversations_for_resolver(target_status=target_status, max_pages=max_pages, sort_order=sort_order)
+
     now_ts = int(time.time())
     seconds_threshold = hours_threshold * 3600
 

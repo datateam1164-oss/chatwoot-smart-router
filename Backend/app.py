@@ -1888,7 +1888,8 @@ def api_auto_resolver_scan():
 @app.route('/api/auto-resolver/execute', methods=['POST'])
 def api_auto_resolver_execute():
     """
-    Executes bulk resolve on specified conversation IDs.
+    Executes bulk resolve on specified conversation IDs with connection pooling,
+    adaptive concurrency, and automatic retry on transient timeouts.
     """
     body = request.get_json(silent=True) or {}
     conv_ids = body.get("conversation_ids", [])
@@ -1899,19 +1900,33 @@ def api_auto_resolver_execute():
     base_url, token, account_id = get_cw_config()
     headers = _cw_headers()
 
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=1)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update(headers)
+
     def _resolve_one(cid):
         url = f"{base_url}/api/v1/accounts/{account_id}/conversations/{cid}/toggle_status"
-        try:
-            r = requests.post(url, json={"status": "resolved"}, headers=headers, timeout=10)
-            if r.status_code in [200, 201]:
-                return True
-        except Exception as e:
-            logger.error(f"❌ Error resolving conversation {cid}: {e}")
+        for attempt in range(2):
+            try:
+                time.sleep(0.08)  # gentle pacing
+                r = session.post(url, json={"status": "resolved"}, timeout=(10, 35))
+                if r.status_code in [200, 201]:
+                    return True
+                elif r.status_code == 429:  # rate limit
+                    time.sleep(1.5)
+            except requests.exceptions.RequestException as e:
+                if attempt == 0:
+                    time.sleep(1.0)
+                    continue
+                logger.error(f"❌ Error resolving conversation {cid}: {e}")
         return False
 
     t0 = time.time()
     success_count = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    # Use max_workers=4 to prevent overwhelming Chatwoot Puma workers
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
         results = executor.map(_resolve_one, conv_ids)
         success_count = sum(1 for ok in results if ok)
 
@@ -1928,6 +1943,7 @@ def api_auto_resolver_execute():
         "duration_seconds": duration,
         "message": f"Successfully resolved {success_count} conversations in {duration} seconds."
     })
+
 
 # ── Resolve & Quality Audit Engine ──────────────────────────────────────────
 

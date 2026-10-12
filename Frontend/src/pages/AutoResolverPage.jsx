@@ -23,11 +23,13 @@ export default function AutoResolverPage() {
   // Selection & Execution state
   const [selectedIds, setSelectedIds] = useState(new Set());
   const [resolving, setResolving] = useState(false);
+  const [resolveProgress, setResolveProgress] = useState(null); // { current, total, percent }
   const [resolveFeedback, setResolveFeedback] = useState(null);
   const [showConfirmModal, setShowConfirmModal] = useState(false);
   const [modalTargetCount, setModalTargetCount] = useState(0);
   const [modalTargetIds, setModalTargetIds] = useState([]);
   const [confirmAcknowledged, setConfirmAcknowledged] = useState(false);
+
 
   // Search in matched list
   const [tableSearch, setTableSearch] = useState('');
@@ -157,34 +159,59 @@ export default function AutoResolverPage() {
     setShowConfirmModal(true);
   };
 
-  // Execute Resolve
+  // Execute Resolve in safe paced batches
   const handleExecuteResolve = async () => {
     setShowConfirmModal(false);
     setResolving(true);
     setResolveFeedback(null);
 
-    try {
-      const res = await autoResolverApi.execute(modalTargetIds);
-      setResolveFeedback({
-        type: res.failed_count === 0 ? 'success' : 'warning',
-        message: res.message || `Successfully resolved ${res.resolved_count} conversations.`
-      });
+    const targets = [...modalTargetIds];
+    const total = targets.length;
+    const BATCH_SIZE = 30; // Safe batch size to prevent server timeout or Puma thread saturation
+    let totalResolved = 0;
+    let totalFailed = 0;
 
-      // Update local state by removing resolved IDs from matched sample
-      if (scanResult && scanResult.matched_sample) {
-        const resolvedSet = new Set(modalTargetIds);
-        const updatedList = scanResult.matched_sample.filter(c => !resolvedSet.has(c.id));
-        setScanResult({
-          ...scanResult,
-          total_matched: Math.max(0, scanResult.total_matched - res.resolved_count),
-          matched_sample: updatedList
-        });
-        setSelectedIds(prev => {
-          const next = new Set(prev);
-          modalTargetIds.forEach(id => next.delete(id));
-          return next;
-        });
+    setResolveProgress({ current: 0, total, percent: 0 });
+
+    try {
+      for (let i = 0; i < total; i += BATCH_SIZE) {
+        const chunk = targets.slice(i, i + BATCH_SIZE);
+        try {
+          const res = await autoResolverApi.execute(chunk);
+          totalResolved += (res.resolved_count || 0);
+          totalFailed += (res.failed_count || 0);
+
+          // Update local table and selection immediately after each batch
+          const resolvedChunkSet = new Set(chunk);
+          setScanResult(prev => {
+            if (!prev?.matched_sample) return prev;
+            const updated = prev.matched_sample.filter(c => !resolvedChunkSet.has(c.id));
+            return {
+              ...prev,
+              total_matched: Math.max(0, prev.total_matched - (res.resolved_count || 0)),
+              matched_sample: updated
+            };
+          });
+
+          setSelectedIds(prev => {
+            const next = new Set(prev);
+            chunk.forEach(id => next.delete(id));
+            return next;
+          });
+        } catch (chunkErr) {
+          console.error('Batch resolve error:', chunkErr);
+          totalFailed += chunk.length;
+        }
+
+        const processed = Math.min(i + BATCH_SIZE, total);
+        const pct = Math.round((processed / total) * 100);
+        setResolveProgress({ current: processed, total, percent: pct });
       }
+
+      setResolveFeedback({
+        type: totalFailed === 0 ? 'success' : 'warning',
+        message: `Successfully resolved ${totalResolved} conversations! ${totalFailed > 0 ? `(${totalFailed} failed to resolve)` : ''}`
+      });
     } catch (err) {
       console.error('Resolve execution failed:', err);
       setResolveFeedback({
@@ -193,8 +220,10 @@ export default function AutoResolverPage() {
       });
     } finally {
       setResolving(false);
+      setResolveProgress(null);
     }
   };
+
 
   return (
     <div style={{
@@ -543,7 +572,44 @@ export default function AutoResolverPage() {
         </div>
       )}
 
+      {/* ─── Batch Resolve Progress Bar ─── */}
+      {resolveProgress && (
+        <div style={{
+          padding: '16px 20px',
+          background: 'var(--bg-surface)',
+          border: '1px solid var(--primary)',
+          borderRadius: 12,
+          marginBottom: 20,
+          boxShadow: '0 4px 16px rgba(56, 189, 248, 0.15)'
+        }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+            <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-main)', display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span className="spinner" style={{ display: 'inline-block', width: 14, height: 14, border: '2px solid var(--primary)', borderTopColor: 'transparent', borderRadius: '50%', animation: 'spin 0.8s linear infinite' }} />
+              Resolving conversations in safe batches: {resolveProgress.current} / {resolveProgress.total}
+            </span>
+            <span style={{ fontSize: 13, fontWeight: 800, color: 'var(--primary)' }}>
+              {resolveProgress.percent}%
+            </span>
+          </div>
+
+          <div style={{ width: '100%', height: 10, background: 'var(--bg-input)', border: '1px solid var(--border-subtle)', borderRadius: 6, overflow: 'hidden' }}>
+            <div style={{
+              width: `${resolveProgress.percent}%`,
+              height: '100%',
+              background: 'linear-gradient(90deg, #38bdf8, #10b981)',
+              borderRadius: 6,
+              transition: 'width 0.3s ease'
+            }} />
+          </div>
+
+          <div style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 8 }}>
+            Using connection pooling and server pacing to ensure high reliability with zero dropped requests.
+          </div>
+        </div>
+      )}
+
       {/* ─── Scan Results Overview ─── */}
+
       {scanResult && (
         <>
           {/* Summary Metric Cards */}

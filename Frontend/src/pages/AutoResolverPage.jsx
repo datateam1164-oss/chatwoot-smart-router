@@ -142,14 +142,20 @@ export default function AutoResolverPage() {
   };
 
   // Trigger Confirmation Modal for Bulk Resolve
-  const promptBulkResolve = () => {
-    const idsToResolve = Array.from(selectedIds);
+  const promptBulkResolve = (resolveAll = false) => {
+    let idsToResolve = [];
+    if (resolveAll) {
+      idsToResolve = scanResult?.all_matched_ids || Array.from(selectedIds);
+    } else {
+      idsToResolve = Array.from(selectedIds);
+    }
     if (idsToResolve.length === 0) return;
     setModalTargetCount(idsToResolve.length);
     setModalTargetIds(idsToResolve);
     setConfirmAcknowledged(false);
     setShowConfirmModal(true);
   };
+
 
   // Trigger single item resolve
   const promptSingleResolve = (cid) => {
@@ -457,10 +463,13 @@ export default function AutoResolverPage() {
               <option value="40">40 Pages (~1,000 conversations)</option>
               <option value="60">60 Pages (~1,500 conversations)</option>
               <option value="80">80 Pages (~2,000 conversations)</option>
+              <option value="120">120 Pages (~3,000 conversations)</option>
+              <option value="160">160 Pages (~4,000 conversations)</option>
             </select>
             <div style={{ fontSize: 11, color: 'var(--text-dim)', marginTop: 6 }}>
               Higher pages allow discovering older archived chats across multiple pages.
             </div>
+
           </div>
 
           {/* 5. Scan Strategy */}
@@ -696,24 +705,48 @@ export default function AutoResolverPage() {
                 </div>
               </div>
 
-              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 10 }}>
+                {/* Secondary Button: Resolve Checked Selection */}
                 <button
                   type="button"
-                  onClick={promptBulkResolve}
+                  onClick={() => promptBulkResolve(false)}
                   disabled={selectedIds.size === 0 || resolving}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 6,
+                    padding: '10px 18px',
+                    borderRadius: 8,
+                    background: 'var(--bg-surface)',
+                    border: '1px solid var(--border-subtle)',
+                    color: selectedIds.size === 0 || resolving ? 'var(--text-dim)' : 'var(--text-main)',
+                    fontSize: 12,
+                    fontWeight: 700,
+                    cursor: selectedIds.size === 0 || resolving ? 'not-allowed' : 'pointer',
+                    transition: 'all 0.2s ease'
+                  }}
+                >
+                  <span>✓</span> Resolve Checked ({selectedIds.size})
+                </button>
+
+                {/* Primary Button: Resolve ALL Matched Conversations */}
+                <button
+                  type="button"
+                  onClick={() => promptBulkResolve(true)}
+                  disabled={scanResult.total_matched === 0 || resolving}
                   style={{
                     display: 'flex',
                     alignItems: 'center',
                     gap: 8,
                     padding: '10px 22px',
                     borderRadius: 8,
-                    background: selectedIds.size === 0 || resolving ? 'var(--border-subtle)' : '#dc2626',
+                    background: scanResult.total_matched === 0 || resolving ? 'var(--border-subtle)' : '#dc2626',
                     color: '#ffffff',
                     border: 'none',
                     fontSize: 13,
                     fontWeight: 800,
-                    cursor: selectedIds.size === 0 || resolving ? 'not-allowed' : 'pointer',
-                    boxShadow: '0 2px 10px rgba(220, 38, 38, 0.3)',
+                    cursor: scanResult.total_matched === 0 || resolving ? 'not-allowed' : 'pointer',
+                    boxShadow: '0 2px 12px rgba(220, 38, 38, 0.35)',
                     transition: 'background 0.2s ease'
                   }}
                 >
@@ -724,13 +757,14 @@ export default function AutoResolverPage() {
                     </>
                   ) : (
                     <>
-                      <span>⚡</span> Resolve Selected ({selectedIds.size})
+                      <span>🚀</span> Resolve ALL {scanResult.total_matched} Matched
                     </>
                   )}
                 </button>
               </div>
             </div>
           )}
+
 
           {/* Table Container */}
           <div style={{

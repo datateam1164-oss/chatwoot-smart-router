@@ -1814,7 +1814,7 @@ def api_auto_resolver_scan():
 
     try:
         max_pages = int(body.get("max_pages", 20))
-        max_pages = max(1, min(max_pages, 80))
+        max_pages = max(1, min(max_pages, 160))
     except (ValueError, TypeError):
         max_pages = 20
 
@@ -1881,9 +1881,10 @@ def api_auto_resolver_scan():
         "hours_threshold": hours_threshold,
         "target_status": target_status,
         "label_mode": label_mode,
-        "matched_sample": matched[:200],
+        "matched_sample": matched[:1500],
         "all_matched_ids": [m["id"] for m in matched]
     })
+
 
 @app.route('/api/auto-resolver/execute', methods=['POST'])
 def api_auto_resolver_execute():

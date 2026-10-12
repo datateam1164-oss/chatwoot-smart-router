@@ -477,4 +477,39 @@ export const agentsApi = {
   }
 };
 
+export const autoResolverApi = {
+  async scan({ status = 'pending', label_mode = 'all', specific_label = '', hours_threshold = 48, max_pages = 20 } = {}) {
+    const res = await apiFetch('/auto-resolver/scan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        status,
+        label_mode,
+        specific_label,
+        hours_threshold: Number(hours_threshold),
+        max_pages: Number(max_pages)
+      })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || 'Failed to scan conversations');
+    }
+    return data;
+  },
+
+  async execute(conversationIds = []) {
+    const res = await apiFetch('/auto-resolver/execute', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ conversation_ids: conversationIds })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || 'Failed to execute bulk resolve');
+    }
+    return data;
+  }
+};
+
+
 

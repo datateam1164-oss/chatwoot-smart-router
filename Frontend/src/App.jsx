@@ -6,6 +6,7 @@ import SettingsPage from './pages/SettingsPage';
 import EventsPage from './pages/EventsPage';
 import LoginPage from './pages/LoginPage';
 import ResolveAuditPage from './pages/ResolveAuditPage';
+import AutoResolverPage from './pages/AutoResolverPage';
 import ErrorBoundary from './components/ErrorBoundary';
 import { authStorage } from './api/agents';
 import { GLOBAL_CSS } from './styles';
@@ -33,11 +34,13 @@ export default function App() {
             </ProtectedRoute>
           }>
             <Route path="/" element={<DashboardPage />} />
+            <Route path="/auto-resolver" element={<AutoResolverPage />} />
             <Route path="/resolve-audit" element={<ResolveAuditPage />} />
             <Route path="/reports" element={<ReportsPage />} />
             <Route path="/events" element={<EventsPage />} />
             <Route path="/settings" element={<SettingsPage />} />
           </Route>
+
 
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

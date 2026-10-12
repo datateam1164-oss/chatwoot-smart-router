@@ -1745,6 +1745,185 @@ def chatwoot_webhook():
         logger.error(f"❌ Webhook handling error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
+# ── Bulk Auto Resolver Engine ─────────────────────────────────────────────
+
+def _fetch_conversations_for_resolver(target_status="pending", max_pages=20):
+    """
+    Fetches conversations across pages for the resolver engine.
+    target_status can be 'pending', 'open', or 'both'.
+    """
+    base_url, token, account_id = get_cw_config()
+    headers = _cw_headers()
+
+    statuses = ["pending"] if target_status == "pending" else (["open"] if target_status == "open" else ["pending", "open"])
+    all_convs = []
+
+    def _fetch_page(st, page_num):
+        url = f"{base_url}/api/v1/accounts/{account_id}/conversations"
+        params = {"status": st, "page": page_num}
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=12)
+            if r.status_code == 200:
+                data = r.json()
+                return data.get("data", {}).get("payload", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        except Exception as e:
+            logger.warning(f"⚠️ Error fetching resolver page {page_num} ({st}): {e}")
+        return []
+
+    tasks = []
+    for st in statuses:
+        for p in range(1, max_pages + 1):
+            tasks.append((st, p))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(_fetch_page, st, p) for st, p in tasks]
+        for f in concurrent.futures.as_completed(futures):
+            res = f.result()
+            if res:
+                all_convs.extend(res)
+
+    # Deduplicate by conversation ID
+    seen = set()
+    deduped = []
+    for c in all_convs:
+        cid = str(c.get("id"))
+        if cid and cid not in seen:
+            seen.add(cid)
+            deduped.append(c)
+
+    return deduped
+
+@app.route('/api/auto-resolver/scan', methods=['POST'])
+def api_auto_resolver_scan():
+    """
+    Scans and previews conversations matching status, label, and inactivity criteria.
+    """
+    body = request.get_json(silent=True) or {}
+    target_status = str(body.get("status", "pending")).strip().lower()
+    label_mode = str(body.get("label_mode", "all")).strip().lower()
+    specific_label = str(body.get("specific_label", "")).strip().lower()
+
+    try:
+        hours_threshold = float(body.get("hours_threshold", 48))
+    except (ValueError, TypeError):
+        hours_threshold = 48.0
+
+    try:
+        max_pages = int(body.get("max_pages", 20))
+        max_pages = max(1, min(max_pages, 80))
+    except (ValueError, TypeError):
+        max_pages = 20
+
+    raw_convs = _fetch_conversations_for_resolver(target_status=target_status, max_pages=max_pages)
+    now_ts = int(time.time())
+    seconds_threshold = hours_threshold * 3600
+
+    matched = []
+    base_url, _, account_id = get_cw_config()
+
+    for c in raw_convs:
+        cid = str(c.get("id"))
+        st = str(c.get("status", "")).lower()
+
+        # Inactivity check: based on last_activity_at or updated_at or created_at
+        act_ts = c.get("last_activity_at") or c.get("updated_at") or c.get("created_at") or 0
+        if not act_ts:
+            continue
+
+        diff_seconds = now_ts - int(act_ts)
+        if diff_seconds < seconds_threshold:
+            continue
+
+        diff_hours = round(diff_seconds / 3600.0, 1)
+        diff_days = round(diff_hours / 24.0, 1)
+
+        # Label check
+        labels_raw = c.get("labels", [])
+        labels = [str(l).strip().lower() for l in labels_raw] if isinstance(labels_raw, list) else []
+
+        if label_mode == "unlabeled":
+            if len(labels) > 0:
+                continue
+        elif label_mode == "specific":
+            if specific_label not in labels:
+                continue
+
+        meta = c.get("meta") or {}
+        sender = meta.get("sender") or {}
+        assignee = meta.get("assignee") or {}
+        last_msg = (c.get("last_non_activity_message") or {}).get("content") or ""
+
+        matched.append({
+            "id": cid,
+            "status": st,
+            "labels": labels_raw,
+            "inactive_hours": diff_hours,
+            "inactive_days": diff_days,
+            "last_activity_timestamp": act_ts,
+            "sender_name": sender.get("name") or sender.get("identifier") or "Unknown",
+            "sender_phone": sender.get("phone_number") or "",
+            "assignee_name": assignee.get("name") or "Unassigned",
+            "last_message": last_msg[:120],
+            "chatwoot_url": f"{base_url}/app/accounts/{account_id}/conversations/{cid}"
+        })
+
+    matched.sort(key=lambda x: x["inactive_hours"], reverse=True)
+
+    return jsonify({
+        "success": True,
+        "total_scanned": len(raw_convs),
+        "total_matched": len(matched),
+        "hours_threshold": hours_threshold,
+        "target_status": target_status,
+        "label_mode": label_mode,
+        "matched_sample": matched[:200],
+        "all_matched_ids": [m["id"] for m in matched]
+    })
+
+@app.route('/api/auto-resolver/execute', methods=['POST'])
+def api_auto_resolver_execute():
+    """
+    Executes bulk resolve on specified conversation IDs.
+    """
+    body = request.get_json(silent=True) or {}
+    conv_ids = body.get("conversation_ids", [])
+
+    if not isinstance(conv_ids, list) or not conv_ids:
+        return jsonify({"success": False, "error": "No conversation IDs provided for resolution."}), 400
+
+    base_url, token, account_id = get_cw_config()
+    headers = _cw_headers()
+
+    def _resolve_one(cid):
+        url = f"{base_url}/api/v1/accounts/{account_id}/conversations/{cid}/toggle_status"
+        try:
+            r = requests.post(url, json={"status": "resolved"}, headers=headers, timeout=10)
+            if r.status_code in [200, 201]:
+                return True
+        except Exception as e:
+            logger.error(f"❌ Error resolving conversation {cid}: {e}")
+        return False
+
+    t0 = time.time()
+    success_count = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        results = executor.map(_resolve_one, conv_ids)
+        success_count = sum(1 for ok in results if ok)
+
+    duration = round(time.time() - t0, 2)
+    failed_count = len(conv_ids) - success_count
+
+    logger.info(f"🧹 Auto Resolver completed: {success_count}/{len(conv_ids)} resolved in {duration}s")
+
+    return jsonify({
+        "success": True,
+        "resolved_count": success_count,
+        "failed_count": failed_count,
+        "total_requested": len(conv_ids),
+        "duration_seconds": duration,
+        "message": f"Successfully resolved {success_count} conversations in {duration} seconds."
+    })
+
 # ── Resolve & Quality Audit Engine ──────────────────────────────────────────
 
 _resolve_audit_cache = {}

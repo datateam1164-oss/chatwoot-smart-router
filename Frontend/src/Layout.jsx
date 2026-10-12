@@ -37,10 +37,15 @@ export default function Layout() {
           <NavLink to="/resolve-audit" onClick={closeSidebar} className={({ isActive }) => `sidebar-link ${isActive ? 'active' : ''}`}>
             <span className="icon">🎯</span> تقرير الريسولف والجودة
           </NavLink>
+
+          <NavLink to="/auto-resolver" onClick={closeSidebar} className={({ isActive }) => `sidebar-link ${isActive ? 'active' : ''}`}>
+            <span className="icon">🧹</span> Auto Resolver
+          </NavLink>
           
           <NavLink to="/reports" onClick={closeSidebar} className={({ isActive }) => `sidebar-link ${isActive ? 'active' : ''}`}>
             <span className="icon">⏱️</span> تقرير التأخيرات
           </NavLink>
+
 
           <NavLink to="/events" onClick={closeSidebar} className={({ isActive }) => `sidebar-link ${isActive ? 'active' : ''}`}>
             <span className="icon">📋</span> أحداث اليوم

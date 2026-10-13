@@ -1177,6 +1177,8 @@ def _build_delays_report(num_pages=6):
     
     all_agents = database.get_all_agents()
     agents_map = {str(a["id"]): dict(a) for a in all_agents}
+    all_mappings = database.get_all_mappings()
+    mapping_dict = {str(m["chatwoot_agent_id"]): m["crm_name"] for m in all_mappings if m.get("chatwoot_agent_id")}
     
     def _fetch_page(p):
         url = f"{base_url}/api/v1/accounts/{account_id}/conversations"
@@ -1215,8 +1217,9 @@ def _build_delays_report(num_pages=6):
         ag_db = agents_map.get(aid, {})
         
         ag_name = ag_db.get("name") or assignee.get("name") or "غير محدد"
-        crm_name = ag_db.get("crm_name") or ""
-        team = ag_db.get("team") or "Sales"
+        crm_name = ag_db.get("crm_name") or mapping_dict.get(aid) or ""
+        is_mapped_sales = bool(crm_name and str(crm_name).strip())
+        team = ag_db.get("team") or ("Sales" if is_mapped_sales else "CS")
         in_shift = _agent_in_shift_hours(ag_db) if ag_db else False
         in_grace = (_agent_in_grace_period(ag_db) and in_shift) if ag_db else False
         
@@ -1225,6 +1228,7 @@ def _build_delays_report(num_pages=6):
                 "agent_id": aid,
                 "agent_name": ag_name,
                 "crm_name": crm_name,
+                "is_mapped_sales": is_mapped_sales,
                 "team": team,
                 "open_chats_count": 0,
                 "pending_count": 0,
@@ -1236,6 +1240,7 @@ def _build_delays_report(num_pages=6):
                 "in_shift": in_shift,
                 "in_grace_period": in_grace
             }
+
         
         agent_stats[aid]["open_chats_count"] += 1
         
@@ -1293,6 +1298,7 @@ def _build_delays_report(num_pages=6):
                 "agent_id": aid,
                 "agent_name": ag_name,
                 "crm_name": crm_name,
+                "is_mapped_sales": is_mapped_sales,
                 "team": team,
                 "in_shift": in_shift,
                 "customer_name": customer_name,
@@ -1300,6 +1306,7 @@ def _build_delays_report(num_pages=6):
                 "last_message": last_msg[:140] if last_msg else "—",
                 "labels": conv.get("labels", [])
             })
+
 
     # Sort pending chats by delay descending (longest delay first)
     pending_chats.sort(key=lambda x: x["delay_minutes"], reverse=True)

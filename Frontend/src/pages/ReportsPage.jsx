@@ -11,11 +11,13 @@ export default function ReportsPage() {
 
   // Filters & Controls
   const [search, setSearch] = useState('');
+  const [salesOnly, setSalesOnly] = useState(false); // Toggle: CRM Mapped Sales only vs All Staff (Sales + CS)
   const [teamFilter, setTeamFilter] = useState('all'); // 'all', 'Sales', 'Data'
   const [severityFilter, setSeverityFilter] = useState('all'); // 'all', 'critical', 'warning', 'normal'
   const [activeTab, setActiveTab] = useState('chats'); // 'chats' or 'agents'
   const [scanPages, setScanPages] = useState(6);
   const [autoRefresh, setAutoRefresh] = useState(false);
+
 
   // Unassign Single Chat Modal
   const [pullModalChat, setPullModalChat] = useState(null);
@@ -88,20 +90,26 @@ export default function ReportsPage() {
     const pending = report.pending_chats || [];
     const agents = report.agents_summary || [];
 
-    // Filter agents with pending chats
-    const delayedAgents = agents.filter(a => (a.pending_count || 0) > 0).slice(0, 10);
-    // Filter critical chats
-    const criticalChats = pending.filter(c => c.severity === 'critical').slice(0, 10);
+    const basePending = salesOnly ? pending.filter(c => c.is_mapped_sales) : pending;
+    const baseAgents = salesOnly ? agents.filter(a => a.is_mapped_sales) : agents;
 
-    let text = `📊 *تقرير تأخيرات الرد ومراقبة الأداء*\n`;
+    // Filter agents with pending chats
+    const delayedAgents = baseAgents.filter(a => (a.pending_count || 0) > 0).slice(0, 10);
+    // Filter critical chats
+    const criticalChats = basePending.filter(c => c.severity === 'critical').slice(0, 10);
+
+    let text = `📊 *تقرير تأخيرات الرد ومراقبة الأداء${salesOnly ? ' (سيلز الـ CRM فقط)' : ''}*\n`;
     text += `🕒 *الوقت:* ${s.timestamp || ''}\n`;
     text += `🔍 *نطاق الفحص:* فحص ${s.total_scanned_chats || 0} محادثة مفتوحة\n`;
+    if (salesOnly) {
+      text += `🎯 *الفلترة:* موظفو السيلز المطابقين في الـ CRM فقط\n`;
+    }
     text += `━━━━━━━━━━━━━━━━━━━━\n`;
     text += `⚡ *الملخص العام:*\n`;
-    text += `💬 إجمالي الشاتات المعلقة: *${s.total_pending_chats || 0}* محادثة\n`;
-    text += `🚨 تأخير حرج (15+ دقيقة): *${s.critical_count || 0}*\n`;
-    text += `⏳ تحذير تأخير (5-14 دقيقة): *${s.warning_count || 0}*\n`;
-    text += `🟢 تأخير طبيعي (<5 دقيقة): *${s.normal_count || 0}*\n`;
+    text += `💬 إجمالي الشاتات المعلقة: *${basePending.length}* محادثة\n`;
+    text += `🚨 تأخير حرج (15+ دقيقة): *${basePending.filter(c => c.severity === 'critical').length}*\n`;
+    text += `⏳ تحذير تأخير (5-14 دقيقة): *${basePending.filter(c => c.severity === 'warning').length}*\n`;
+    text += `🟢 تأخير طبيعي (<5 دقيقة): *${basePending.filter(c => c.severity === 'normal').length}*\n`;
     text += `🏃 أطول مدة انتظار: *${s.longest_delay_formatted || '0 د'}* (${s.most_delayed_agent || 'لا يوجد'})\n`;
 
     if (delayedAgents.length > 0) {
@@ -109,7 +117,7 @@ export default function ReportsPage() {
       text += `👥 *الموظفون الأكثر تأخراً في الرد:*\n`;
       delayedAgents.forEach((a, i) => {
         const flag = a.critical_count > 0 ? '🚨' : '⏳';
-        text += `${i + 1}. *${a.agent_name}* (${a.team}) | ${a.pending_count} معلق | أقصى تأخير: ${a.max_delay_text} ${flag}\n`;
+        text += `${i + 1}. *${a.agent_name}* (${a.crm_name ? 'CRM: ' + a.crm_name : a.team}) | ${a.pending_count} معلق | أقصى تأخير: ${a.max_delay_text} ${flag}\n`;
       });
     }
 
@@ -118,7 +126,8 @@ export default function ReportsPage() {
       text += `🚨 *الشاتات الأكثر حرجاً (15+ دقيقة):*\n`;
       criticalChats.forEach(c => {
         const phone = c.customer_phone ? ` (${c.customer_phone})` : '';
-        text += `• #${c.conv_id} | ${c.agent_name} | عميل: ${c.customer_name}${phone} | انتظار: ${c.waiting_since_text}\n`;
+        const lbls = (c.labels && c.labels.length > 0) ? ` [${c.labels.join(', ')}]` : '';
+        text += `• #${c.conv_id}${lbls} | ${c.agent_name} | عميل: ${c.customer_name}${phone} | انتظار: ${c.waiting_since_text}\n`;
       });
     }
 
@@ -152,6 +161,8 @@ export default function ReportsPage() {
   const filteredChats = useMemo(() => {
     if (!report || !report.pending_chats) return [];
     return report.pending_chats.filter(c => {
+      // Sales only filter (CRM mapped sales)
+      if (salesOnly && !c.is_mapped_sales) return false;
       // Team filter
       if (teamFilter !== 'all' && c.team !== teamFilter) return false;
       // Severity filter
@@ -165,18 +176,21 @@ export default function ReportsPage() {
         const matchCustomer = (c.customer_name || '').toLowerCase().includes(q);
         const matchPhone = (c.customer_phone || '').toLowerCase().includes(q);
         const matchMsg = (c.last_message || '').toLowerCase().includes(q);
-        if (!matchId && !matchAgent && !matchCrm && !matchCustomer && !matchPhone && !matchMsg) {
+        const matchLabel = (c.labels || []).some(l => String(l).toLowerCase().includes(q));
+        if (!matchId && !matchAgent && !matchCrm && !matchCustomer && !matchPhone && !matchMsg && !matchLabel) {
           return false;
         }
       }
       return true;
     });
-  }, [report, teamFilter, severityFilter, search]);
+  }, [report, salesOnly, teamFilter, severityFilter, search]);
 
   // Filtered Agents Summary
   const filteredAgents = useMemo(() => {
     if (!report || !report.agents_summary) return [];
     return report.agents_summary.filter(a => {
+      // Sales only filter
+      if (salesOnly && !a.is_mapped_sales) return false;
       if (teamFilter !== 'all' && a.team !== teamFilter) return false;
       if (search.trim()) {
         const q = search.trim().toLowerCase();
@@ -186,7 +200,8 @@ export default function ReportsPage() {
       }
       return true;
     });
-  }, [report, teamFilter, search]);
+  }, [report, salesOnly, teamFilter, search]);
+
 
   const summary = report?.summary || {
     total_scanned_chats: 0,
@@ -588,12 +603,64 @@ export default function ReportsPage() {
 
         {/* Row 2: Filter Chips */}
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12, paddingTop: 10, borderTop: `1px solid ${C.borderLight}` }}>
+          {/* Staff Category Filter: Sales CRM vs All */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, background: 'rgba(255,255,255,0.03)', padding: '3px 8px', borderRadius: 10, border: `1px solid ${C.borderLight}` }}>
+            <span style={{ fontSize: 12, color: C.textDim, marginLeft: 4 }}>نوع الموظفين:</span>
+            <button
+              onClick={() => setSalesOnly(false)}
+              style={{
+                padding: '5px 12px',
+                borderRadius: 8,
+                fontSize: 12,
+                fontWeight: !salesOnly ? 700 : 500,
+                cursor: 'pointer',
+                background: !salesOnly ? 'rgba(56,189,248,0.18)' : 'transparent',
+                color: !salesOnly ? C.accent : C.textDim,
+                border: !salesOnly ? `1px solid ${C.accentBorder}` : '1px solid transparent',
+                transition: 'all 0.15s ease'
+              }}
+            >
+              🌐 جميع الموظفين (سيلز + CS)
+            </button>
+            <button
+              onClick={() => setSalesOnly(true)}
+              style={{
+                padding: '5px 14px',
+                borderRadius: 8,
+                fontSize: 12,
+                fontWeight: salesOnly ? 800 : 600,
+                cursor: 'pointer',
+                background: salesOnly ? 'rgba(16,185,129,0.22)' : 'transparent',
+                color: salesOnly ? C.greenLight : C.textDim,
+                border: salesOnly ? '1px solid rgba(16,185,129,0.6)' : '1px solid transparent',
+                boxShadow: salesOnly ? '0 0 12px rgba(16,185,129,0.2)' : 'none',
+                transition: 'all 0.15s ease',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 6
+              }}
+              title="عرض موظفي السيلز المطابقين في الـ CRM فقط واستبعاد موظفي خدمة العملاء CS"
+            >
+              <span>🌟 سيلز الـ CRM فقط</span>
+              {salesOnly && (
+                <span style={{
+                  fontSize: 10,
+                  background: 'rgba(16,185,129,0.3)',
+                  color: '#fff',
+                  padding: '1px 6px',
+                  borderRadius: 6
+                }}>مُفعّل</span>
+              )}
+            </button>
+          </div>
+
           {/* Team Filter */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             <span style={{ fontSize: 12, color: C.textDim, marginLeft: 4 }}>التيم:</span>
             {[
               { id: 'all', label: 'الكل' },
               { id: 'Sales', label: 'Sales' },
+              { id: 'CS', label: 'CS' },
               { id: 'Data', label: 'Data' }
             ].map(t => (
               <button
@@ -707,19 +774,20 @@ export default function ReportsPage() {
             <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'right', fontSize: 13 }}>
               <thead>
                 <tr style={{ background: 'rgba(255,255,255,0.02)', borderBottom: `1px solid ${C.border}`, color: C.textDim }}>
-                  <th style={{ padding: '12px 16px', fontWeight: 700, width: 100 }}># المحادثة</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 700, width: 90 }}># المحادثة</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 700, minWidth: 140 }}>التصنيف (الليبل)</th>
                   <th style={{ padding: '12px 16px', fontWeight: 700 }}>العميل</th>
-                  <th style={{ padding: '12px 16px', fontWeight: 700, minWidth: 220 }}>آخر رسالة من العميل</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 700, minWidth: 200 }}>آخر رسالة من العميل</th>
                   <th style={{ padding: '12px 16px', fontWeight: 700 }}>الموظف المسند إليه</th>
                   <th style={{ padding: '12px 16px', fontWeight: 700 }}>مدة الانتظار</th>
-                  <th style={{ padding: '12px 16px', fontWeight: 700, textAlign: 'center', width: 140 }}>درجة التأخير</th>
-                  <th style={{ padding: '12px 16px', fontWeight: 700, textAlign: 'center', width: 150 }}>إجراء المشرف</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 700, textAlign: 'center', width: 130 }}>درجة التأخير</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 700, textAlign: 'center', width: 140 }}>إجراء المشرف</th>
                 </tr>
               </thead>
               <tbody>
                 {filteredChats.length === 0 ? (
                   <tr>
-                    <td colSpan={7} style={{ textAlign: 'center', padding: '50px 20px', color: C.textDim }}>
+                    <td colSpan={8} style={{ textAlign: 'center', padding: '50px 20px', color: C.textDim }}>
                       <div style={{ fontSize: 32, marginBottom: 10 }}>🎉</div>
                       <div style={{ fontSize: 15, fontWeight: 700, color: C.textBright }}>لا توجد محادثات معلقة مطابقة للفلاتر المحددة</div>
                       <div style={{ fontSize: 12, marginTop: 4 }}>جميع الشاتات في النطاق المفحوص تم الرد عليها أو لا تنتظر رداً</div>
@@ -760,6 +828,37 @@ export default function ReportsPage() {
                           </a>
                         </td>
 
+                        {/* Labels / Categories */}
+                        <td style={{ padding: '12px 16px' }}>
+                          {chat.labels && chat.labels.length > 0 ? (
+                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                              {chat.labels.map((lbl, idx) => (
+                                <span
+                                  key={idx}
+                                  style={{
+                                    fontSize: 11,
+                                    padding: '2px 7px',
+                                    borderRadius: 6,
+                                    background: 'rgba(56,189,248,0.12)',
+                                    color: C.accent,
+                                    border: `1px solid ${C.accentBorder}`,
+                                    fontWeight: 600,
+                                    whiteSpace: 'nowrap',
+                                    display: 'inline-flex',
+                                    alignItems: 'center',
+                                    gap: 3
+                                  }}
+                                >
+                                  <span>🏷️</span>
+                                  <span>{lbl}</span>
+                                </span>
+                              ))}
+                            </div>
+                          ) : (
+                            <span style={{ fontSize: 11, color: C.textDim, opacity: 0.6 }}>بدون ليبل</span>
+                          )}
+                        </td>
+
                         {/* Customer Info */}
                         <td style={{ padding: '12px 16px' }}>
                           <div style={{ fontWeight: 600, color: C.textBright }}>{chat.customer_name}</div>
@@ -773,7 +872,7 @@ export default function ReportsPage() {
                         </td>
 
                         {/* Last Message Snippet */}
-                        <td style={{ padding: '12px 16px', maxWidth: 280 }}>
+                        <td style={{ padding: '12px 16px', maxWidth: 260 }}>
                           <div style={{
                             color: C.text,
                             fontSize: 12,
@@ -796,18 +895,23 @@ export default function ReportsPage() {
                               fontSize: 10,
                               padding: '1px 6px',
                               borderRadius: 6,
-                              background: chat.team === 'Sales' ? 'rgba(56,189,248,0.12)' : 'rgba(167,139,250,0.12)',
-                              color: chat.team === 'Sales' ? C.accent : C.purple,
-                              fontWeight: 700
+                              background: chat.is_mapped_sales ? 'rgba(56,189,248,0.15)' : 'rgba(148,163,184,0.12)',
+                              color: chat.is_mapped_sales ? C.accent : C.textDim,
+                              fontWeight: 700,
+                              border: `1px solid ${chat.is_mapped_sales ? C.accentBorder : 'rgba(148,163,184,0.25)'}`
                             }}>
-                              {chat.team}
+                              {chat.is_mapped_sales ? 'Sales' : 'CS'}
                             </span>
                           </div>
-                          {chat.crm_name && (
-                            <div style={{ fontSize: 11, color: C.textDim, marginTop: 2 }}>
+                          {chat.crm_name ? (
+                            <div style={{ fontSize: 11, color: C.greenLight, marginTop: 2, fontWeight: 600 }}>
                               CRM: {chat.crm_name}
                             </div>
-                          )}
+                          ) : !chat.is_mapped_sales ? (
+                            <div style={{ fontSize: 10, color: C.textDim, marginTop: 2 }}>
+                              غير مطابق بـ CRM (دعم)
+                            </div>
+                          ) : null}
                         </td>
 
                         {/* Waiting Time */}
@@ -953,11 +1057,15 @@ export default function ReportsPage() {
                         {/* Agent Name */}
                         <td style={{ padding: '12px 16px' }}>
                           <div style={{ fontWeight: 700, color: C.textBright }}>{ag.agent_name}</div>
-                          {ag.crm_name && (
-                            <div style={{ fontSize: 11, color: C.textDim, marginTop: 2 }}>
+                          {ag.crm_name ? (
+                            <div style={{ fontSize: 11, color: C.greenLight, marginTop: 2, fontWeight: 600 }}>
                               CRM: {ag.crm_name}
                             </div>
-                          )}
+                          ) : !ag.is_mapped_sales ? (
+                            <div style={{ fontSize: 10, color: C.textDim, marginTop: 2 }}>
+                              غير مطابق بـ CRM (دعم)
+                            </div>
+                          ) : null}
                         </td>
 
                         {/* Team */}
@@ -966,11 +1074,12 @@ export default function ReportsPage() {
                             fontSize: 11,
                             padding: '2px 8px',
                             borderRadius: 6,
-                            background: ag.team === 'Sales' ? 'rgba(56,189,248,0.12)' : 'rgba(167,139,250,0.12)',
-                            color: ag.team === 'Sales' ? C.accent : C.purple,
-                            fontWeight: 700
+                            background: ag.is_mapped_sales ? 'rgba(56,189,248,0.15)' : 'rgba(148,163,184,0.12)',
+                            color: ag.is_mapped_sales ? C.accent : C.textDim,
+                            fontWeight: 700,
+                            border: `1px solid ${ag.is_mapped_sales ? C.accentBorder : 'rgba(148,163,184,0.25)'}`
                           }}>
-                            {ag.team}
+                            {ag.is_mapped_sales ? 'Sales' : 'CS'}
                           </span>
                         </td>
 

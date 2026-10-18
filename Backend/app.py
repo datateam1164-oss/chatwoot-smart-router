@@ -1210,8 +1210,22 @@ def _is_chat_delay_exempt(conv):
         all_stickers = True
         for att in attachments:
             ft = str(att.get("file_type") or "").lower()
+            ext = str(att.get("extension") or "").lower()
             durl = str(att.get("data_url") or "").lower()
-            if ft == "sticker" or durl.endswith(".webp"):
+            fsize = int(att.get("file_size") or 0)
+            w = att.get("width")
+            h = att.get("height")
+            is_sticker_att = (
+                ft in ("sticker", "ig_reel", "story_mention")
+                or ext in ("webp", "gif")
+                or durl.endswith(".webp")
+                or durl.endswith(".gif")
+                or "39178562_1505197616293642" in durl
+                or "369239263222822" in durl
+                or (0 < fsize <= 18000 and ft == "image")
+                or (w and h and w == h and w <= 512 and (ext in ("png", "webp", "gif") or (0 < fsize <= 55000)))
+            )
+            if is_sticker_att:
                 continue
             all_stickers = False
             break
@@ -1236,15 +1250,22 @@ def _is_chat_delay_exempt(conv):
         .replace('ة', 'ه')
         .replace('ى', 'ي')
         .replace('ً', '')
+        .replace('ـ', '')
     )
+    # Collapse repeated consecutive letters (e.g. 'تمامم' -> 'تمام', 'شكرااا' -> 'شكرا', 'ماشييي' -> 'ماشي')
+    text_dedup = re.sub(r'(.)\1+', r'\1', text_norm)
 
     explicit_closing_phrases = [
         'لا شكرا', 'مش عايزين نشترك', 'مش عاوزين نشترك', 'مش محتاج حاجه', 'مش محتاج',
-        'هشوف كده وكلمك', 'هشوف كدا وكلمك', 'هشوف واكلمك', 'هكلم حضرتك تاني', 'هكلمك تاني',
-        'هرجع لحضرتك', 'هسال وارد عليك', 'خلاص مش محتاج', 'شكرا مش محتاج'
+        'مش عايز', 'مش عاوز', 'م عايزه', 'م عايز', 'مش عايزه', 'مش عاوزه',
+        'خلاص انا هروح دروس', 'خلاص مش محتاج', 'شكرا مش محتاج',
+        'خلاص شكرا لحضرتك انا اشتركت', 'انا اشتركت خلاص', 'اشتركت بالفعل', 'اشتركت خلاص', 'تم الاشتراك',
+        'تم حل المشكله', 'اتحلت المشكله', 'المشكله اتحلت',
+        'هشوف كده وكلمك', 'هشوف كدا وكلمك', 'هشوف واكلمك', 'هفكر واكلمك', 'هكلم حضرتك تاني', 'هكلمك تاني',
+        'هرجع لحضرتك', 'هسال وارد عليك'
     ]
     for ecp in explicit_closing_phrases:
-        if ecp in text_norm and len(text_norm) <= len(ecp) + 18:
+        if (ecp in text_norm and len(text_norm) <= len(ecp) + 22) or (ecp in text_dedup and len(text_dedup) <= len(ecp) + 22):
             return True, "courtesy_closing"
 
     inquiry_indicators = [
@@ -1263,30 +1284,32 @@ def _is_chat_delay_exempt(conv):
         return False, ""
 
     courtesy_phrases = {
-        'تمام', 'ماشي', 'شكرا', 'اشكرك', 'تسلم', 'تسلمي', 'الف شكر', 'شكرا جدا',
+        'تمام', 'تم', 'ماشي', 'شكرا', 'اشكرك', 'تسلم', 'تسلمي', 'الف شكر', 'شكرا جدا',
         'شكرا جزيلا', 'شكرا لحضرتك', 'شكرا يا فندم', 'تسلم يا غالي', 'تسلم ايدك',
         'تسلم يا باشا', 'شكرا ليك', 'شكرا ليكي', 'تمام يا فندم', 'تمام ماشي',
         'ماشي تمام', 'خلاص تمام', 'اوك تمام', 'تمام اوك', 'اوكي تمام', 'اوكيه',
         'اوكي', 'اوك', 'ok', 'okay', 'k', 'thanks', 'thank you', 'thx', 'ty', 'like',
         'جزاك الله خيرا', 'ربنا يخليك', 'ربنا يباركلك', 'تمام فهمت', 'فهمت خلاص',
         'فهمت', 'وصلت', 'كده تمام', 'كدا تمام', 'تمام كدا', 'تمام كده', 'كله تمام',
-        'مفيش مشكله', 'ولا يهمك', 'حبيبي تسلم', 'عفوا', 'سلام', 'مع السلامه', 'باي',
-        'bye', 'خلاص', 'حاضر', 'طيب', 'طيب تمام', 'ماشي شكرا', 'تمام ماشي شكرا',
-        'تمام شكرا', 'شكرا تمام', 'ان شاء الله', 'باذن الله', 'بالتوفيق', 'حبيبي', 'تمام تسلم'
+        'مفيش مشكله', 'ولا يهمك', 'حبيبي تسلم', 'عفوا', 'العفو', 'ميرسي', 'merci',
+        'سلام', 'مع السلامه', 'باي', 'bye', 'خلاص', 'حاضر', 'طيب', 'طيب تمام',
+        'ماشي شكرا', 'تمام ماشي شكرا', 'تمام شكرا', 'شكرا تمام', 'ان شاء الله',
+        'باذن الله', 'بالتوفيق', 'حبيبي', 'تمام تسلم'
     }
 
-    if text_norm in courtesy_phrases:
+    if text_norm in courtesy_phrases or text_dedup in courtesy_phrases:
         return True, "courtesy_closing"
 
     words = text_norm.split()
+    words_dedup = text_dedup.split()
     courtesy_words = {
-        'تمام', 'ماشي', 'شكرا', 'اشكرك', 'تسلم', 'تسلمي', 'الف', 'شكر', 'جدا', 'جزيلا',
+        'تمام', 'تم', 'ماشي', 'شكرا', 'اشكرك', 'تسلم', 'تسلمي', 'الف', 'شكر', 'جدا', 'جزيلا',
         'لحضرتك', 'يا', 'فندم', 'غالي', 'ايدك', 'باشا', 'ليك', 'ليكي', 'خلاص', 'اوك',
         'اوكي', 'اوكيه', 'ok', 'okay', 'thanks', 'thank', 'you', 'thx', 'جزاك', 'الله',
         'خيرا', 'ربنا', 'يخليك', 'يباركلك', 'فهمت', 'وصلت', 'كده', 'كدا', 'كله', 'حاضر',
-        'طيب', 'عفوا', 'سلام', 'باي', 'حبيبي', 'ان', 'شاء', 'باذن'
+        'طيب', 'عفوا', 'العفو', 'ميرسي', 'merci', 'سلام', 'باي', 'حبيبي', 'ان', 'شاء', 'باذن'
     }
-    if 1 <= len(words) <= 5 and all(w in courtesy_words for w in words):
+    if 1 <= len(words) <= 5 and all((w in courtesy_words or wd in courtesy_words) for w, wd in zip(words, words_dedup)):
         return True, "courtesy_closing"
 
     return False, ""
@@ -2219,8 +2242,13 @@ def classify_resolved_chat(first_reply, last_non_activity_msg):
     msg_type = last_non_activity_msg.get('message_type')
     content = (last_non_activity_msg.get('content') or '').strip()
 
-    if msg_type == 1:
+    if msg_type == 1 or last_non_activity_msg.get('private') is True:
         return 'agent_replied', '✅ تم الرد والإغلاق بنجاح (آخر رسالة من الموظف)', False
+
+    is_ex, ex_reason = _is_chat_delay_exempt({"last_non_activity_message": last_non_activity_msg})
+    if is_ex:
+        disp = content[:40] if content else "لايك / ملصق 👍"
+        return 'natural_closing', f'💬 إغلاق طبيعي (رسالة شكر/تأكيد: "{disp}")', False
 
     # Customer was the last speaker (msg_type == 0)
     text_clean = re.sub(r'[^\w\s]', ' ', content).strip().lower()

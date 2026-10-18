@@ -547,6 +547,7 @@ def set_routing_enabled(enabled: bool):
 
 def _periodic_routing_loop():
     logger.info("🔄 Periodic Routing Engine thread started (Default: Standby/Paused)...")
+    last_smart_reassign_ts = 0
     while True:
         try:
             if is_routing_enabled():
@@ -555,7 +556,17 @@ def _periodic_routing_loop():
                     logger.info(f"✅ Auto-Cycle Finished: Routed {routed} conversations.")
         except Exception as e:
             logger.error(f"❌ Periodic routing error: {e}")
-            
+
+        try:
+            cfg = _get_smart_reassign_config()
+            if cfg.get("auto_enabled") and cfg.get("labels") and (time.time() - last_smart_reassign_ts >= 120):
+                last_smart_reassign_ts = time.time()
+                res = _execute_smart_reassign()
+                if res.get("reassigned_count", 0) > 0:
+                    logger.info(f"⚡ Auto Smart-Reassign Finished: Reassigned {res['reassigned_count']} delayed conversations.")
+        except Exception as e:
+            logger.error(f"❌ Periodic smart reassign error: {e}")
+
         settings = database.get_settings()
         interval = int(settings.get("periodic_interval", 60))
         # Wait for interval or instant wake-up event
@@ -1834,16 +1845,28 @@ def api_reports_delays():
         pages = 0
 
     now = time.time()
+    report_data = None
     with delays_cache_lock:
         if not refresh and delays_cache.get("data") is not None:
             if delays_cache.get("pages") == pages and (now - delays_cache.get("cached_at", 0) < 25):  # 25 seconds TTL
-                return jsonify(delays_cache["data"])
+                report_data = dict(delays_cache["data"])
 
-    report_data = _build_delays_report(num_pages=pages)
-    with delays_cache_lock:
-        delays_cache["data"] = report_data
-        delays_cache["cached_at"] = now
-        delays_cache["pages"] = pages
+    if report_data is None:
+        report_data = _build_delays_report(num_pages=pages)
+        with delays_cache_lock:
+            delays_cache["data"] = report_data
+            delays_cache["cached_at"] = now
+            delays_cache["pages"] = pages
+        report_data = dict(report_data)
+
+    # Always attach fresh smart_reassign config, configured_sales_labels, and recent transfer history
+    report_data["smart_reassign_config"] = _get_smart_reassign_config()
+    try:
+        settings = database.get_settings()
+        report_data["configured_sales_labels"] = json.loads(settings.get("valid_labels_order", "[]"))
+    except Exception:
+        report_data["configured_sales_labels"] = []
+    report_data["smart_reassign_history"] = _smart_reassign_history[:25]
 
     return jsonify(report_data)
 
@@ -1875,6 +1898,438 @@ def api_unassign_conversation(conv_id):
         "conv_id": conv_id,
         "message": f"تم سحب المحادثة #{conv_id} بنجاح وإعادتها لقائمة الانتظار."
     })
+
+
+# ── Smart Delayed Chats Reassignment Engine (الأعلى سكور + الأقل شاتات + داخل الشيفت) ──
+
+_smart_reassign_lock = threading.Lock()
+_smart_reassign_history = []  # Recent transfers log
+
+
+def _get_smart_reassign_config():
+    settings = database.get_settings()
+    raw_labels = settings.get("smart_reassign_labels")
+    if raw_labels is not None:
+        try:
+            labels = json.loads(raw_labels)
+            if not isinstance(labels, list):
+                labels = []
+        except Exception:
+            labels = []
+    else:
+        # Default to configured valid sales labels
+        try:
+            labels = json.loads(settings.get("valid_labels_order", "[]"))
+        except Exception:
+            labels = []
+
+    try:
+        min_delay = float(settings.get("smart_reassign_min_delay", 15))
+    except (ValueError, TypeError):
+        min_delay = 15.0
+
+    try:
+        max_open = int(settings.get("smart_reassign_max_open_chats", 45))
+    except (ValueError, TypeError):
+        max_open = 45
+
+    match_label = str(settings.get("smart_reassign_match_agent_label", "true")).lower() in ["true", "1", "yes"]
+    auto_enabled = str(settings.get("smart_reassign_auto_enabled", "false")).lower() in ["true", "1", "yes"]
+
+    return {
+        "labels": labels,
+        "min_delay_minutes": min_delay,
+        "max_open_chats": max_open,
+        "match_agent_label": match_label,
+        "auto_enabled": auto_enabled
+    }
+
+
+def _agent_matches_chat_label(ag, matched_label):
+    """Checks if an agent is allowed to receive a given label based on their assigned_labels."""
+    if not matched_label:
+        return True
+    assigned = ag.get("assigned_labels")
+    if assigned and isinstance(assigned, str):
+        try:
+            assigned = json.loads(assigned)
+        except Exception:
+            assigned = []
+    elif not assigned:
+        assigned = []
+
+    matched_clean = str(matched_label).strip().lower()
+    is_unlabeled_chat = ("بدون ليبل" in matched_clean or "unlabeled" in matched_clean or "no_label" in matched_clean)
+
+    if len(assigned) > 0:
+        assigned_lower = [str(l).strip().lower() for l in assigned]
+        if is_unlabeled_chat:
+            return any("بدون ليبل" in x or "unlabeled" in x or "بدون تصنيف" in x or "no_label" in x for x in assigned_lower)
+        for x in assigned_lower:
+            if x == matched_clean or matched_clean in x or x in matched_clean:
+                return True
+        return False
+    else:
+        # Agent has no specific label restrictions (receives any labeled chat, but unlabeled requires explicit selection)
+        return not is_unlabeled_chat
+
+
+def _chat_matches_pullable_labels(chat_labels, pullable_labels):
+    """
+    Returns (is_match: bool, matched_label_str: str)
+    Checks if a delayed chat's labels match the supervisor's selected pullable labels.
+    """
+    if not pullable_labels:
+        return False, ""
+    pullable_set = {str(l).strip().lower() for l in pullable_labels if str(l).strip()}
+    if not pullable_set:
+        return False, ""
+
+    c_labels = [str(l).strip() for l in (chat_labels or []) if str(l).strip()]
+    if not c_labels:
+        if any(u in pullable_set for u in ("unlabeled", "no_label", "بدون ليبل", "بدون ليبل (unlabeled)")):
+            return True, "بدون ليبل (Unlabeled)"
+        return False, ""
+
+    for lbl in c_labels:
+        if lbl.lower() in pullable_set:
+            return True, lbl
+    return False, ""
+
+
+def _execute_smart_reassign(target_conv_id=None, override_config=None):
+    """
+    Pulls delayed conversations (matching selected pullable labels & min_delay_minutes, or a specific target_conv_id)
+    and reassigns each to the best available IN-SHIFT Sales agent based on:
+      - High speed_score AND low open_chats_count (smart_priority = speed_score - open_chats*0.85 - pending*4)
+      - Open chats strictly below max_open_chats cap (so nobody reaches 80 while others have 30)
+      - Active in shift right now (not off-shift, not in grace period, not paused)
+    """
+    if not _smart_reassign_lock.acquire(blocking=False):
+        return {"success": False, "error": "عملية سحب وتوزيع أخرى قيد التنفيذ حالياً، يرجى الانتظار ثواني."}
+
+    try:
+        cfg = _get_smart_reassign_config()
+        if override_config and isinstance(override_config, dict):
+            if "labels" in override_config and isinstance(override_config["labels"], list):
+                cfg["labels"] = override_config["labels"]
+            if "min_delay_minutes" in override_config:
+                try:
+                    cfg["min_delay_minutes"] = float(override_config["min_delay_minutes"])
+                except Exception:
+                    pass
+            if "max_open_chats" in override_config:
+                try:
+                    cfg["max_open_chats"] = int(override_config["max_open_chats"])
+                except Exception:
+                    pass
+            if "match_agent_label" in override_config:
+                cfg["match_agent_label"] = bool(override_config["match_agent_label"])
+
+        # Get fresh or cached full delays report
+        now = time.time()
+        with delays_cache_lock:
+            cached_rep = delays_cache.get("data")
+            cached_at = delays_cache.get("cached_at", 0)
+
+        if cached_rep and (now - cached_at < 25):
+            report_data = cached_rep
+        else:
+            report_data = _build_delays_report(num_pages=0)
+            with delays_cache_lock:
+                delays_cache["data"] = report_data
+                delays_cache["cached_at"] = time.time()
+                delays_cache["pages"] = 0
+
+        pending_chats = report_data.get("pending_chats", [])
+        agents_summary_map = {str(a["agent_id"]): dict(a) for a in report_data.get("agents_summary", [])}
+
+        # Filter target chats to reassign
+        chats_to_reassign = []
+        if target_conv_id is not None:
+            t_str = str(target_conv_id)
+            for ch in pending_chats:
+                if str(ch.get("conv_id")) == t_str:
+                    c_lbls = ch.get("labels") or []
+                    m_lbl = c_lbls[0] if c_lbls else "بدون ليبل (Unlabeled)"
+                    chats_to_reassign.append((ch, m_lbl))
+                    break
+            if not chats_to_reassign:
+                return {"success": False, "error": f"المحادثة #{target_conv_id} لم تعد متأخرة أو تم الرد عليها بالفعل."}
+        else:
+            if not cfg["labels"]:
+                return {"success": False, "error": "يرجى تحديد ليبل واحد على الأقل من قائمة الليبلات المسموح بسحبها."}
+            for ch in pending_chats:
+                if float(ch.get("delay_minutes") or 0) < cfg["min_delay_minutes"]:
+                    continue
+                ok_lbl, m_lbl = _chat_matches_pullable_labels(ch.get("labels"), cfg["labels"])
+                if not ok_lbl:
+                    continue
+                chats_to_reassign.append((ch, m_lbl))
+
+        if not chats_to_reassign:
+            return {
+                "success": True,
+                "reassigned_count": 0,
+                "transfers": [],
+                "message": "لا توجد محادثات متأخرة مطابقة لليبلات ووقت التأخير المحددين حالياً."
+            }
+
+        # Build live pool of all DB agents + shift/window status + live open_chats & speed_score
+        settings = database.get_settings()
+        window_minutes = int(settings.get("window_minutes", 30))
+        today_counts = database.get_all_agents_today_chats_counts()
+        official_open = fetch_agent_report_counts()
+        all_db_agents = database.get_all_agents()
+
+        candidate_agents = []
+        for ag in all_db_agents:
+            aid_str = str(ag["id"])
+            if ag.get("team") not in ["Sales", "Data"]:
+                continue
+            if not ag.get("is_selected", 1):
+                continue
+            if ag.get("is_paused", 0):
+                continue
+
+            ag = database.check_and_reset_agent_window(ag, window_minutes=window_minutes)
+            if not _agent_has_valid_shift(ag):
+                continue
+
+            daily_lim = int(ag.get("daily_chat_limit") or 100)
+            today_cnt = int(today_counts.get(aid_str, 0))
+            if today_cnt >= daily_lim:
+                continue
+
+            rep_st = agents_summary_map.get(aid_str, {})
+            open_cnt = max(
+                int(rep_st.get("open_chats_count") or 0),
+                int(official_open.get(aid_str) or 0),
+                int(ag.get("active_chats") or 0)
+            )
+            speed_sc = int(rep_st.get("speed_score") if rep_st.get("speed_score") is not None else 0)
+            crit_cnt = int(rep_st.get("critical_count") or 0)
+            pend_cnt = int(rep_st.get("pending_count") or 0)
+
+            ag_copy = dict(ag)
+            ag_copy["live_open_chats"] = open_cnt
+            ag_copy["live_speed_score"] = speed_sc
+            ag_copy["live_critical_count"] = crit_cnt
+            ag_copy["live_pending_count"] = pend_cnt
+            ag_copy["live_today_count"] = today_cnt
+            ag_copy["daily_limit"] = daily_lim
+            candidate_agents.append(ag_copy)
+
+        if not candidate_agents:
+            return {
+                "success": False,
+                "error": "لا يوجد موظفو سيلز متاحون داخل الشيفت حالياً لاستلام المحادثات."
+            }
+
+        transfers = []
+        skipped = []
+        now_ts = int(time.time())
+        now_str = datetime.now(CAIRO_TZ).strftime("%I:%M:%S %p")
+
+        # Sort chats to reassign by longest delay first
+        chats_to_reassign.sort(key=lambda x: float(x[0].get("delay_minutes") or 0), reverse=True)
+
+        for ch, matched_label in chats_to_reassign:
+            cid = str(ch.get("conv_id"))
+            old_aid = str(ch.get("agent_id") or "")
+            old_aname = ch.get("agent_name") or "غير محدد"
+            delay_min = ch.get("delay_minutes") or 0
+
+            # Filter eligible receivers for this specific chat
+            def _filter_receivers(enforce_label=True, enforce_zero_crit=True, enforce_open_cap=True):
+                pool = []
+                for cand in candidate_agents:
+                    c_id = str(cand["id"])
+                    if c_id == old_aid:
+                        continue
+                    if int(cand.get("current_window_chats") or 0) >= int(cand.get("chat_limit") or 10):
+                        continue
+                    if cand["live_today_count"] >= cand["daily_limit"]:
+                        continue
+                    if enforce_open_cap and cand["live_open_chats"] >= cfg["max_open_chats"]:
+                        continue
+                    if enforce_zero_crit and cand["live_critical_count"] > 0:
+                        continue
+                    if enforce_label and cfg["match_agent_label"] and not _agent_matches_chat_label(cand, matched_label):
+                        continue
+                    pool.append(cand)
+                return pool
+
+            eligible_pool = _filter_receivers(enforce_label=True, enforce_zero_crit=True, enforce_open_cap=True)
+            if not eligible_pool:
+                # Fallback 1: relax zero-critical if all in-shift label-matched agents have 1 critical chat, still enforcing open cap & label
+                eligible_pool = _filter_receivers(enforce_label=True, enforce_zero_crit=False, enforce_open_cap=True)
+            if not eligible_pool and cfg["match_agent_label"]:
+                # Fallback 2: if no agent has that specific label in shift under cap, allow any in-shift Sales agent under cap with 0 critical
+                eligible_pool = _filter_receivers(enforce_label=False, enforce_zero_crit=True, enforce_open_cap=True)
+
+            if not eligible_pool:
+                skipped.append({
+                    "conv_id": cid,
+                    "label": matched_label,
+                    "reason": f"لا يوجد موظف متاح في الشيفت أقل من سقف ({cfg['max_open_chats']} شات مفتوح)"
+                })
+                continue
+
+            # Rank eligible receivers by Smart Priority:
+            # High speed_score + Low open_chats_count + Low pending_count
+            def _receiver_priority(cand):
+                sc = cand["live_speed_score"]
+                op = cand["live_open_chats"]
+                pn = cand["live_pending_count"]
+                cr = cand["live_critical_count"]
+                # Composite priority: rewards high speed_score while strongly penalizing high open chat load
+                priority = sc - (op * 0.85) - (pn * 4.0) - (cr * 8.0)
+                return (priority, -op, sc)
+
+            eligible_pool.sort(key=_receiver_priority, reverse=True)
+            best_receiver = eligible_pool[0]
+            new_aid = str(best_receiver["id"])
+            new_aname = best_receiver.get("name") or f"Agent #{new_aid}"
+
+            # Assign in Chatwoot directly to the new agent
+            if assign_conversation_in_chatwoot(cid, new_aid):
+                if old_aid:
+                    database.decrement_agent_window_chats(old_aid, 1)
+                database.increment_agent_window_chats(new_aid)
+                database.mark_chats_as_pulled([cid])
+                database.log_routed_chat(
+                    conv_id=cid,
+                    agent_id=new_aid,
+                    agent_name=new_aname,
+                    label=matched_label,
+                    sender_phone=ch.get("customer_phone", ""),
+                    sender_name=ch.get("customer_name", ""),
+                    last_message=ch.get("last_message", "")
+                )
+
+                # Reset assignment timer for the new agent so their 15m window starts fresh from right now!
+                with _chat_tracker_lock:
+                    _chat_assignment_cache[(cid, new_aid)] = {
+                        "assign_ts": now_ts,
+                        "agent_handled": False,
+                        "act_ts": now_ts
+                    }
+                    _chat_wait_tracker[f"{cid}_{new_aid}"] = now_ts
+                    _chat_wait_tracker[cid] = now_ts
+
+                with assigned_lock:
+                    recently_assigned_convs[cid] = time.time()
+
+                # Update live counts in memory so the next chat in this batch is load-balanced fairly
+                best_receiver["live_open_chats"] += 1
+                best_receiver["live_pending_count"] += 1
+                best_receiver["live_today_count"] += 1
+                best_receiver["current_window_chats"] = int(best_receiver.get("current_window_chats") or 0) + 1
+
+                transfer_item = {
+                    "conv_id": cid,
+                    "label": matched_label,
+                    "customer_name": ch.get("customer_name") or "",
+                    "delay_minutes": delay_min,
+                    "from_agent_id": old_aid,
+                    "from_agent_name": old_aname,
+                    "to_agent_id": new_aid,
+                    "to_agent_name": new_aname,
+                    "to_agent_score": best_receiver["live_speed_score"],
+                    "to_agent_open_chats": best_receiver["live_open_chats"],
+                    "timestamp": now_str
+                }
+                transfers.append(transfer_item)
+                _smart_reassign_history.insert(0, transfer_item)
+                if len(_smart_reassign_history) > 100:
+                    del _smart_reassign_history[100:]
+
+                logger.info(
+                    f"⚡ Smart Reassigned delayed conv #{cid} ({matched_label}, {delay_min}m delay) "
+                    f"from {old_aname} -> {new_aname} (score: {best_receiver['live_speed_score']}, open: {best_receiver['live_open_chats']})"
+                )
+                time.sleep(0.06)
+            else:
+                skipped.append({
+                    "conv_id": cid,
+                    "label": matched_label,
+                    "reason": "فشل الاتصال بـ Chatwoot أثناء التحويل"
+                })
+
+        # Invalidate delays cache so UI reflects updated assignments immediately
+        if transfers:
+            with delays_cache_lock:
+                delays_cache["data"] = None
+                delays_cache["cached_at"] = 0
+
+        return {
+            "success": True,
+            "reassigned_count": len(transfers),
+            "skipped_count": len(skipped),
+            "transfers": transfers,
+            "skipped": skipped,
+            "history": _smart_reassign_history[:25],
+            "message": (
+                f"تم بنجاح سحب وإعادة توزيع {len(transfers)} محادثة متأخرة لأفضل الموظفين المتاحين في الشيفت (الأعلى سكور والأقل ضغطاً)."
+                if transfers else "لم يتم تحويل أي محادثة (لا يوجد موظفون مطابقون تحت سقف الشاتات المفتوحة)."
+            )
+        }
+    finally:
+        _smart_reassign_lock.release()
+
+
+@app.route('/api/reports/smart-reassign/config', methods=['GET', 'POST'])
+def api_smart_reassign_config():
+    if request.method == 'POST':
+        body = request.get_json(silent=True) or {}
+        if "labels" in body and isinstance(body["labels"], list):
+            database.set_setting("smart_reassign_labels", json.dumps(body["labels"], ensure_ascii=False))
+        if "min_delay_minutes" in body:
+            database.set_setting("smart_reassign_min_delay", str(body["min_delay_minutes"]))
+        if "max_open_chats" in body:
+            database.set_setting("smart_reassign_max_open_chats", str(body["max_open_chats"]))
+        if "match_agent_label" in body:
+            database.set_setting("smart_reassign_match_agent_label", "true" if body["match_agent_label"] else "false")
+        if "auto_enabled" in body:
+            database.set_setting("smart_reassign_auto_enabled", "true" if body["auto_enabled"] else "false")
+
+    cfg = _get_smart_reassign_config()
+    settings = database.get_settings()
+    try:
+        configured_sales_labels = json.loads(settings.get("valid_labels_order", "[]"))
+    except Exception:
+        configured_sales_labels = []
+
+    return jsonify({
+        "success": True,
+        "config": cfg,
+        "configured_sales_labels": configured_sales_labels,
+        "history": _smart_reassign_history[:25]
+    })
+
+
+@app.route('/api/reports/smart-reassign/execute', methods=['POST'])
+def api_smart_reassign_execute():
+    body = request.get_json(silent=True) or {}
+    conv_id = body.get("conv_id")
+    override_cfg = body.get("config") if isinstance(body.get("config"), dict) else body
+    # Save config if provided
+    if isinstance(override_cfg, dict):
+        if "labels" in override_cfg and isinstance(override_cfg["labels"], list):
+            database.set_setting("smart_reassign_labels", json.dumps(override_cfg["labels"], ensure_ascii=False))
+        if "min_delay_minutes" in override_cfg:
+            database.set_setting("smart_reassign_min_delay", str(override_cfg["min_delay_minutes"]))
+        if "max_open_chats" in override_cfg:
+            database.set_setting("smart_reassign_max_open_chats", str(override_cfg["max_open_chats"]))
+        if "match_agent_label" in override_cfg:
+            database.set_setting("smart_reassign_match_agent_label", "true" if override_cfg["match_agent_label"] else "false")
+        if "auto_enabled" in override_cfg:
+            database.set_setting("smart_reassign_auto_enabled", "true" if override_cfg["auto_enabled"] else "false")
+
+    res = _execute_smart_reassign(target_conv_id=conv_id, override_config=override_cfg)
+    status_code = 200 if res.get("success") else 400
+    return jsonify(res), status_code
 
 @app.route('/api/crm/sync', methods=['POST'])
 def api_crm_sync():

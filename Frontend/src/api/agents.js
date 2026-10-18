@@ -416,6 +416,44 @@ export const agentsApi = {
     return res.json();
   },
 
+  async getSmartReassignConfig() {
+    const res = await apiFetch('/reports/smart-reassign/config');
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'فشل جلب إعدادات التحويل الذكي');
+    }
+    return res.json();
+  },
+
+  async saveSmartReassignConfig(config) {
+    const res = await apiFetch('/reports/smart-reassign/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config || {}),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'فشل حفظ إعدادات التحويل الذكي');
+    }
+    return res.json();
+  },
+
+  async executeSmartReassign({ convId = null, config = null } = {}) {
+    const body = {};
+    if (convId !== null && convId !== undefined) body.conv_id = convId;
+    if (config && typeof config === 'object') Object.assign(body, config);
+    const res = await apiFetch('/reports/smart-reassign/execute', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'فشل تنفيذ التحويل الذكي');
+    }
+    return res.json();
+  },
+
   async getPendingSummary(force = false) {
     const res = await apiFetch(`/pending-conversations/summary?force=${force ? 'true' : 'false'}`);
     if (!res.ok) {

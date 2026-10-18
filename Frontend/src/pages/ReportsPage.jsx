@@ -24,9 +24,24 @@ export default function ReportsPage() {
   const [pullModalChat, setPullModalChat] = useState(null);
   const [pullingChat, setPullingChat] = useState(false);
 
+  // Smart Delayed Reassignment State (سحب وإعادة توزيع المتأخرات للأعلى سكور والأقل شاتات)
+  const [reassignConfig, setReassignConfig] = useState({
+    labels: [],
+    min_delay_minutes: 15,
+    max_open_chats: 45,
+    match_agent_label: true,
+    auto_enabled: false
+  });
+  const [reassignConfigLoaded, setReassignConfigLoaded] = useState(false);
+  const [savingReassignConfig, setSavingReassignConfig] = useState(false);
+  const [executingReassign, setExecutingReassign] = useState(false);
+  const [reassigningConvId, setReassigningConvId] = useState(null);
+  const [reassignHistory, setReassignHistory] = useState([]);
+  const [showReassignHistory, setShowReassignHistory] = useState(false);
+
   const showNotification = (msg, type = 'success') => {
     setNotification({ msg, type });
-    setTimeout(() => setNotification(null), 4000);
+    setTimeout(() => setNotification(null), 5000);
   };
 
   const loadReport = useCallback(async (isManualRefresh = false) => {
@@ -36,6 +51,19 @@ export default function ReportsPage() {
       const data = await agentsApi.fetchDelaysReport(isManualRefresh, scanPages);
       if (data && data.success) {
         setReport(data);
+        if (data.smart_reassign_config && !reassignConfigLoaded) {
+          setReassignConfig({
+            labels: Array.isArray(data.smart_reassign_config.labels) ? data.smart_reassign_config.labels : [],
+            min_delay_minutes: Number(data.smart_reassign_config.min_delay_minutes ?? 15),
+            max_open_chats: Number(data.smart_reassign_config.max_open_chats ?? 45),
+            match_agent_label: Boolean(data.smart_reassign_config.match_agent_label ?? true),
+            auto_enabled: Boolean(data.smart_reassign_config.auto_enabled ?? false)
+          });
+          setReassignConfigLoaded(true);
+        }
+        if (Array.isArray(data.smart_reassign_history)) {
+          setReassignHistory(data.smart_reassign_history);
+        }
         if (isManualRefresh) {
           showNotification('تم تحديث التقرير بنجاح', 'success');
         }
@@ -52,7 +80,7 @@ export default function ReportsPage() {
       setLoading(false);
       setRefreshing(false);
     }
-  }, [scanPages]);
+  }, [scanPages, reassignConfigLoaded]);
 
   useEffect(() => {
     loadReport(false);
@@ -66,6 +94,146 @@ export default function ReportsPage() {
     }, 30000);
     return () => clearInterval(interval);
   }, [autoRefresh, loadReport]);
+
+  // Available labels for Smart Reassign + count of delayed chats per label
+  const availableLabelsForReassign = useMemo(() => {
+    const labelMap = new Map();
+    const configured = report?.configured_sales_labels || [];
+    configured.forEach(lbl => {
+      const clean = String(lbl || '').trim();
+      if (clean && !labelMap.has(clean)) {
+        labelMap.set(clean, { label: clean, delayedCount: 0, totalPending: 0 });
+      }
+    });
+
+    // Always include Unlabeled option
+    const UNLABELED_KEY = 'unlabeled';
+    if (!labelMap.has(UNLABELED_KEY)) {
+      labelMap.set(UNLABELED_KEY, { label: UNLABELED_KEY, displayTitle: 'بدون ليبل (Unlabeled)', delayedCount: 0, totalPending: 0 });
+    }
+
+    const pending = report?.pending_chats || [];
+    const minDelay = Number(reassignConfig.min_delay_minutes || 15);
+
+    pending.forEach(ch => {
+      const isDelayed = Number(ch.delay_minutes || 0) >= minDelay;
+      const cLabels = Array.isArray(ch.labels) ? ch.labels.filter(Boolean) : [];
+      if (cLabels.length === 0) {
+        const entry = labelMap.get(UNLABELED_KEY);
+        if (entry) {
+          entry.totalPending += 1;
+          if (isDelayed) entry.delayedCount += 1;
+        }
+      } else {
+        cLabels.forEach(rawL => {
+          const clean = String(rawL).trim();
+          if (!clean) return;
+          if (!labelMap.has(clean)) {
+            labelMap.set(clean, { label: clean, delayedCount: 0, totalPending: 0 });
+          }
+          const entry = labelMap.get(clean);
+          entry.totalPending += 1;
+          if (isDelayed) entry.delayedCount += 1;
+        });
+      }
+    });
+
+    return Array.from(labelMap.values()).sort((a, b) => (b.delayedCount - a.delayedCount) || (b.totalPending - a.totalPending));
+  }, [report, reassignConfig.min_delay_minutes]);
+
+  // Count how many delayed chats match the currently selected pullable labels
+  const matchingPullableChats = useMemo(() => {
+    const pending = report?.pending_chats || [];
+    const selectedSet = new Set((reassignConfig.labels || []).map(l => String(l).trim().toLowerCase()));
+    if (selectedSet.size === 0) return [];
+    const minDelay = Number(reassignConfig.min_delay_minutes || 15);
+
+    return pending.filter(ch => {
+      if (Number(ch.delay_minutes || 0) < minDelay) return false;
+      const cLabels = Array.isArray(ch.labels) ? ch.labels.filter(Boolean) : [];
+      if (cLabels.length === 0) {
+        return selectedSet.has('unlabeled') || selectedSet.has('بدون ليبل') || selectedSet.has('بدون ليبل (unlabeled)');
+      }
+      return cLabels.some(l => selectedSet.has(String(l).trim().toLowerCase()));
+    });
+  }, [report, reassignConfig.labels, reassignConfig.min_delay_minutes]);
+
+  const handleTogglePullableLabel = (lbl) => {
+    setReassignConfig(prev => {
+      const exists = prev.labels.some(x => String(x).toLowerCase() === String(lbl).toLowerCase());
+      const nextLabels = exists
+        ? prev.labels.filter(x => String(x).toLowerCase() !== String(lbl).toLowerCase())
+        : [...prev.labels, lbl];
+      return { ...prev, labels: nextLabels };
+    });
+  };
+
+  const handleSaveSmartReassignConfig = async (customCfg = null) => {
+    const cfgToSave = customCfg || reassignConfig;
+    setSavingReassignConfig(true);
+    try {
+      const res = await agentsApi.saveSmartReassignConfig(cfgToSave);
+      if (res && res.config) {
+        setReassignConfig(res.config);
+      }
+      showNotification('✅ تم حفظ إعدادات السحب والتحويل الذكي بنجاح', 'success');
+    } catch (err) {
+      showNotification(err.message || 'فشل حفظ الإعدادات', 'error');
+    } finally {
+      setSavingReassignConfig(false);
+    }
+  };
+
+  const handleExecuteBulkSmartReassign = async () => {
+    if (!reassignConfig.labels || reassignConfig.labels.length === 0) {
+      showNotification('⚠️ يرجى اختيار ليبل واحد على الأقل من الليبلات المسموح بسحبها أولاً', 'error');
+      return;
+    }
+    setExecutingReassign(true);
+    try {
+      const res = await agentsApi.executeSmartReassign({ config: reassignConfig });
+      if (res && Array.isArray(res.history)) {
+        setReassignHistory(res.history);
+      }
+      if (res && res.reassigned_count > 0) {
+        showNotification(`⚡ ${res.message}`, 'success');
+        setShowReassignHistory(true);
+        loadReport(true);
+      } else {
+        showNotification(res?.message || 'لا توجد محادثات متأخرة مطابقة للتحويل حالياً', 'error');
+      }
+    } catch (err) {
+      showNotification(err.message || 'فشل تنفيذ السحب والتحويل الذكي', 'error');
+    } finally {
+      setExecutingReassign(false);
+    }
+  };
+
+  const handleSingleSmartReassign = async (chat) => {
+    if (!chat || !chat.conv_id) return;
+    setReassigningConvId(chat.conv_id);
+    try {
+      const res = await agentsApi.executeSmartReassign({ convId: chat.conv_id, config: reassignConfig });
+      if (res && Array.isArray(res.history)) {
+        setReassignHistory(res.history);
+      }
+      if (res && res.reassigned_count > 0 && res.transfers && res.transfers[0]) {
+        const tr = res.transfers[0];
+        showNotification(
+          `⚡ تم تحويل الشات #${tr.conv_id} من (${tr.from_agent_name}) إلى (${tr.to_agent_name} | السكور: ${tr.to_agent_score > 0 ? '+' + tr.to_agent_score : tr.to_agent_score} | مفتوح: ${tr.to_agent_open_chats})`,
+          'success'
+        );
+        loadReport(true);
+      } else {
+        const reason = res?.skipped?.[0]?.reason || res?.message || 'لم يتم العثور على موظف متاح تحت سقف الشاتات';
+        showNotification(`⚠️ تعذر تحويل الشات #${chat.conv_id}: ${reason}`, 'error');
+      }
+    } catch (err) {
+      showNotification(err.message || 'فشل تحويل المحادثة للأفضل', 'error');
+    } finally {
+      setReassigningConvId(null);
+    }
+  };
 
   // Single Chat Unassign Handler
   const handleConfirmUnassign = async () => {
@@ -540,6 +708,370 @@ export default function ReportsPage() {
             </div>
           </div>
         </div>
+      </div>
+
+      {/* ── Smart Delayed Reassignment Engine (سحب المتأخرات وتوزيعها للأعلى سكور والأقل شاتات حسب الليبلات المختارة) ── */}
+      <div style={{
+        background: 'linear-gradient(135deg, rgba(16,185,129,0.06) 0%, rgba(56,189,248,0.06) 50%, rgba(168,85,247,0.06) 100%)',
+        borderRadius: 16,
+        padding: '18px 20px',
+        marginBottom: 20,
+        border: '1px solid rgba(56,189,248,0.28)',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 14
+      }}>
+        {/* Header Row */}
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 20 }}>⚡</span>
+            <div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <strong style={{ fontSize: 15, color: C.textBright }}>
+                  سحب وإعادة توزيع الشاتات المتأخرة ذكياً (للأعلى سكور والأقل شاتات داخل الشيفت)
+                </strong>
+                <span style={{
+                  fontSize: 11,
+                  padding: '2px 9px',
+                  borderRadius: 8,
+                  background: reassignConfig.auto_enabled ? 'rgba(16,185,129,0.2)' : 'rgba(148,163,184,0.14)',
+                  color: reassignConfig.auto_enabled ? C.greenLight : C.textDim,
+                  border: `1px solid ${reassignConfig.auto_enabled ? 'rgba(16,185,129,0.5)' : 'rgba(148,163,184,0.25)'}`,
+                  fontWeight: 700
+                }}>
+                  {reassignConfig.auto_enabled ? '🟢 السحب التلقائي مفعّل' : '⚪ وضع التحكم اليدوي'}
+                </span>
+              </div>
+              <div style={{ fontSize: 11, color: C.textDim, marginTop: 3 }}>
+                يسحب الشات المتأخر فقط إذا كان يحمل أحد <strong style={{ color: C.accent }}>الليبلات المختارة بالأسفل</strong>، ويحوّله لأفضل موظف متاح في الشيفت يوازن بين <strong style={{ color: C.greenLight }}>أعلى سكور سرعة</strong> و<strong style={{ color: C.yellowLight }}>أقل عدد شاتات مفتوحة</strong> (حتى لا يتكدس موظف بـ 80 شات وآخر بـ 30).
+              </div>
+            </div>
+          </div>
+
+          {/* Action Buttons */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <button
+              onClick={handleExecuteBulkSmartReassign}
+              disabled={executingReassign || loading || matchingPullableChats.length === 0}
+              className="btn"
+              style={{
+                background: matchingPullableChats.length > 0
+                  ? 'linear-gradient(135deg, #10b981, #059669)'
+                  : 'rgba(255,255,255,0.06)',
+                color: matchingPullableChats.length > 0 ? '#fff' : C.textDim,
+                border: matchingPullableChats.length > 0 ? '1px solid rgba(16,185,129,0.6)' : `1px solid ${C.border}`,
+                fontWeight: 800,
+                fontSize: 13,
+                padding: '8px 16px',
+                borderRadius: 10,
+                cursor: (executingReassign || matchingPullableChats.length === 0) ? 'not-allowed' : 'pointer',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 7,
+                boxShadow: matchingPullableChats.length > 0 ? '0 4px 14px rgba(16,185,129,0.25)' : 'none'
+              }}
+              title="سحب جميع الشاتات المتأخرة المطابقة لليبلات المختارة وتحويلها للأعلى سكور والأقل شاتات فوراً"
+            >
+              <span>{executingReassign ? '⏳' : '🚀'}</span>
+              <span>
+                {executingReassign
+                  ? 'جاري السحب والتحويل...'
+                  : `سحب وتحويل المتأخرات المختارة الآن (${matchingPullableChats.length} شات)`}
+              </span>
+            </button>
+
+            <button
+              onClick={() => handleSaveSmartReassignConfig()}
+              disabled={savingReassignConfig}
+              className="btn"
+              style={{
+                background: 'rgba(56,189,248,0.14)',
+                color: C.accent,
+                border: `1px solid ${C.accentBorder}`,
+                fontWeight: 700,
+                fontSize: 12,
+                padding: '8px 13px',
+                borderRadius: 10,
+                cursor: savingReassignConfig ? 'not-allowed' : 'pointer'
+              }}
+              title="حفظ اختيارات الليبلات والضوابط في قاعدة البيانات"
+            >
+              {savingReassignConfig ? '⏳ جاري الحفظ...' : '💾 حفظ الإعدادات'}
+            </button>
+
+            {reassignHistory.length > 0 && (
+              <button
+                onClick={() => setShowReassignHistory(prev => !prev)}
+                className="btn"
+                style={{
+                  background: showReassignHistory ? 'rgba(168,85,247,0.22)' : 'rgba(255,255,255,0.05)',
+                  color: showReassignHistory ? C.purple : C.textMuted,
+                  border: `1px solid ${showReassignHistory ? 'rgba(168,85,247,0.5)' : C.border}`,
+                  fontWeight: 700,
+                  fontSize: 12,
+                  padding: '8px 12px',
+                  borderRadius: 10,
+                  cursor: 'pointer'
+                }}
+              >
+                📜 سجل التحويلات ({reassignHistory.length})
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Row 2: Selectable Pullable Labels (اختيار الليبلات المسموح بسحبها فقط) */}
+        <div style={{
+          background: 'rgba(15,23,42,0.55)',
+          padding: '12px 14px',
+          borderRadius: 12,
+          border: `1px solid ${C.borderLight}`
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8, marginBottom: 10 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+              <span style={{ fontSize: 13, fontWeight: 800, color: C.textBright }}>
+                🏷️ اختر الليبلات (البولات) المطلوب سحبها عند التأخير:
+              </span>
+              <span style={{ fontSize: 11, color: C.textDim }}>
+                (محدد حالياً: <strong style={{ color: C.accent }}>{reassignConfig.labels.length}</strong> ليبل — الشاتات غير المحددة هنا تُترك مع موظفها حتى لو تأخر)
+              </span>
+            </div>
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <button
+                onClick={() => setReassignConfig(prev => ({ ...prev, labels: availableLabelsForReassign.map(x => x.label) }))}
+                style={{
+                  fontSize: 11,
+                  padding: '3px 9px',
+                  borderRadius: 6,
+                  background: 'rgba(56,189,248,0.12)',
+                  color: C.accent,
+                  border: `1px solid ${C.accentBorder}`,
+                  cursor: 'pointer',
+                  fontWeight: 700
+                }}
+              >
+                تحديد الكل
+              </button>
+              <button
+                onClick={() => setReassignConfig(prev => ({ ...prev, labels: [] }))}
+                style={{
+                  fontSize: 11,
+                  padding: '3px 9px',
+                  borderRadius: 6,
+                  background: 'rgba(239,68,68,0.12)',
+                  color: C.redLight,
+                  border: `1px solid ${C.redBorder}`,
+                  cursor: 'pointer',
+                  fontWeight: 700
+                }}
+              >
+                إلغاء الكل
+              </button>
+            </div>
+          </div>
+
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+            {availableLabelsForReassign.map(item => {
+              const isSelected = reassignConfig.labels.some(
+                x => String(x).toLowerCase() === String(item.label).toLowerCase()
+              );
+              const title = item.displayTitle || item.label;
+              return (
+                <button
+                  key={item.label}
+                  onClick={() => handleTogglePullableLabel(item.label)}
+                  style={{
+                    padding: '6px 12px',
+                    borderRadius: 9,
+                    fontSize: 12,
+                    fontWeight: isSelected ? 800 : 600,
+                    cursor: 'pointer',
+                    background: isSelected
+                      ? 'rgba(16,185,129,0.2)'
+                      : 'rgba(255,255,255,0.04)',
+                    color: isSelected ? C.greenLight : C.textMuted,
+                    border: isSelected
+                      ? '1px solid rgba(16,185,129,0.55)'
+                      : `1px solid ${C.border}`,
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 6,
+                    transition: 'all 0.15s ease'
+                  }}
+                  title={isSelected ? 'مُفعّل للسحب عند التأخير (اضغط للإلغاء)' : 'غير مفعّل للسحب — سيتم ترك شاتات هذا الليبل مع الموظف (اضغط للتفعيل)'}
+                >
+                  <span>{isSelected ? '✅' : '⬜'}</span>
+                  <span>{title}</span>
+                  {item.delayedCount > 0 && (
+                    <span style={{
+                      background: isSelected ? 'rgba(239,68,68,0.85)' : 'rgba(239,68,68,0.22)',
+                      color: isSelected ? '#fff' : C.redLight,
+                      padding: '1px 6px',
+                      borderRadius: 10,
+                      fontSize: 10,
+                      fontWeight: 800
+                    }}>
+                      {item.delayedCount} متأخر
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Row 3: Threshold & Load Balancing Controls */}
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 14 }}>
+          {/* Min Delay Threshold */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 12, color: C.textDim, fontWeight: 600 }}>⏱️ سحب الشات بعد تأخير:</span>
+            {[10, 15, 20, 30, 45].map(mins => (
+              <button
+                key={mins}
+                onClick={() => setReassignConfig(prev => ({ ...prev, min_delay_minutes: mins }))}
+                style={{
+                  padding: '4px 10px',
+                  borderRadius: 7,
+                  fontSize: 11,
+                  fontWeight: 700,
+                  cursor: 'pointer',
+                  background: Number(reassignConfig.min_delay_minutes) === mins ? 'rgba(239,68,68,0.2)' : 'rgba(255,255,255,0.04)',
+                  color: Number(reassignConfig.min_delay_minutes) === mins ? C.redLight : C.textDim,
+                  border: Number(reassignConfig.min_delay_minutes) === mins ? `1px solid ${C.redBorder}` : '1px solid transparent'
+                }}
+              >
+                {mins} دقيقة+
+              </button>
+            ))}
+          </div>
+
+          {/* Max Open Chats Cap for Receiver */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 12, color: C.textDim, fontWeight: 600 }} title="لا يتم إرسال شات مسحوب لموظف وصل عدد الشاتات المفتوحة عنده لهذا السقف حتى لو كان سكوره عالياً">
+              ⚖️ سقف الشاتات المفتوحة للمستلم:
+            </span>
+            {[25, 35, 45, 55, 70].map(cap => (
+              <button
+                key={cap}
+                onClick={() => setReassignConfig(prev => ({ ...prev, max_open_chats: cap }))}
+                style={{
+                  padding: '4px 10px',
+                  borderRadius: 7,
+                  fontSize: 11,
+                  fontWeight: 700,
+                  cursor: 'pointer',
+                  background: Number(reassignConfig.max_open_chats) === cap ? 'rgba(56,189,248,0.2)' : 'rgba(255,255,255,0.04)',
+                  color: Number(reassignConfig.max_open_chats) === cap ? C.accent : C.textDim,
+                  border: Number(reassignConfig.max_open_chats) === cap ? `1px solid ${C.accentBorder}` : '1px solid transparent'
+                }}
+              >
+                أقل من {cap} شات
+              </button>
+            ))}
+          </div>
+
+          {/* Match Agent Label & Auto-Reassign Toggle */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+            <label style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 6,
+              fontSize: 12,
+              color: C.textBright,
+              cursor: 'pointer',
+              background: 'rgba(255,255,255,0.04)',
+              padding: '5px 10px',
+              borderRadius: 8,
+              border: `1px solid ${C.borderLight}`
+            }}>
+              <input
+                type="checkbox"
+                checked={Boolean(reassignConfig.match_agent_label)}
+                onChange={(e) => setReassignConfig(prev => ({ ...prev, match_agent_label: e.target.checked }))}
+                style={{ accentColor: C.accent, cursor: 'pointer' }}
+              />
+              <span>مطابقة ليبل/تخصص الموظف</span>
+            </label>
+
+            <button
+              onClick={() => {
+                const nextVal = !reassignConfig.auto_enabled;
+                const nextCfg = { ...reassignConfig, auto_enabled: nextVal };
+                setReassignConfig(nextCfg);
+                handleSaveSmartReassignConfig(nextCfg);
+              }}
+              style={{
+                padding: '5px 12px',
+                borderRadius: 8,
+                fontSize: 12,
+                fontWeight: 700,
+                cursor: 'pointer',
+                background: reassignConfig.auto_enabled ? 'rgba(16,185,129,0.22)' : 'rgba(255,255,255,0.04)',
+                color: reassignConfig.auto_enabled ? C.greenLight : C.textDim,
+                border: reassignConfig.auto_enabled ? '1px solid rgba(16,185,129,0.55)' : `1px solid ${C.border}`
+              }}
+              title="عند التفعيل يقوم النظام كل دقيقتين بفحص الشاتات المتأخرة من الليبلات المحددة فقط وتحويلها للأعلى سكور والأقل شاتات في الشيفت تلقائياً"
+            >
+              {reassignConfig.auto_enabled ? '🤖 السحب التلقائي: مفعّل (كل دقيقتين)' : '🤖 تفعيل السحب التلقائي كل دقيقتين'}
+            </button>
+          </div>
+        </div>
+
+        {/* Collapsible Recent Smart Reassign History */}
+        {showReassignHistory && reassignHistory.length > 0 && (
+          <div style={{
+            background: 'rgba(15,23,42,0.75)',
+            borderRadius: 12,
+            padding: '12px 14px',
+            border: '1px solid rgba(168,85,247,0.35)',
+            maxHeight: 220,
+            overflowY: 'auto'
+          }}>
+            <div style={{ fontSize: 12, fontWeight: 800, color: C.purple, marginBottom: 8 }}>
+              📜 آخر التحويلات الذكية المنفذة (من المتأخر ⬅️ للأعلى سكور والأقل شاتات):
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {reassignHistory.map((item, idx) => (
+                <div
+                  key={`${item.conv_id}-${idx}`}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    flexWrap: 'wrap',
+                    gap: 8,
+                    fontSize: 12,
+                    padding: '6px 10px',
+                    borderRadius: 8,
+                    background: 'rgba(255,255,255,0.03)',
+                    border: `1px solid ${C.borderLight}`
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                    <strong style={{ color: C.accent }}>#{item.conv_id}</strong>
+                    <span style={{
+                      fontSize: 10,
+                      padding: '1px 6px',
+                      borderRadius: 6,
+                      background: 'rgba(56,189,248,0.12)',
+                      color: C.accent
+                    }}>
+                      🏷️ {item.label}
+                    </span>
+                    <span style={{ color: C.textDim }}>تأخير: {item.delay_minutes} د</span>
+                    <span style={{ color: C.redLight }}>من: <strong>{item.from_agent_name}</strong></span>
+                    <span>⬅️</span>
+                    <span style={{ color: C.greenLight }}>
+                      إلى: <strong>{item.to_agent_name}</strong> (السكور: {item.to_agent_score > 0 ? `+${item.to_agent_score}` : item.to_agent_score} | مفتوح: {item.to_agent_open_chats})
+                    </span>
+                  </div>
+                  <span style={{ fontSize: 11, color: C.textDim, direction: 'ltr' }}>{item.timestamp}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* ── Filters & Tabs Navigation ── */}
@@ -1020,24 +1552,45 @@ export default function ReportsPage() {
                           )}
                         </td>
 
-                        {/* Supervisor Action Button */}
+                        {/* Supervisor Action Buttons */}
                         <td style={{ padding: '12px 16px', textAlign: 'center', whiteSpace: 'nowrap' }}>
-                          <button
-                            onClick={() => setPullModalChat(chat)}
-                            className="btn btn-sm"
-                            style={{
-                              background: 'rgba(239,68,68,0.15)',
-                              color: C.redLight,
-                              border: `1px solid ${C.redBorder}`,
-                              fontSize: 12,
-                              fontWeight: 700,
-                              padding: '4px 10px'
-                            }}
-                            title="فك إسناد هذا الشات وإعادته للانتظار في Chatwoot فوراً"
-                          >
-                            <span>📥</span>
-                            <span>سحب للانتظار</span>
-                          </button>
+                          <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                            <button
+                              onClick={() => handleSingleSmartReassign(chat)}
+                              disabled={reassigningConvId === chat.conv_id}
+                              className="btn btn-sm"
+                              style={{
+                                background: 'rgba(16,185,129,0.16)',
+                                color: C.greenLight,
+                                border: '1px solid rgba(16,185,129,0.45)',
+                                fontSize: 11,
+                                fontWeight: 800,
+                                padding: '4px 9px',
+                                cursor: reassigningConvId === chat.conv_id ? 'not-allowed' : 'pointer'
+                              }}
+                              title="سحب هذا الشات فوراً وتحويله لأفضل موظف في الشيفت (الأعلى سكور والأقل شاتات مفتوحة)"
+                            >
+                              <span>{reassigningConvId === chat.conv_id ? '⏳' : '⚡'}</span>
+                              <span>{reassigningConvId === chat.conv_id ? 'جاري التحويل...' : 'تحويل للأفضل'}</span>
+                            </button>
+
+                            <button
+                              onClick={() => setPullModalChat(chat)}
+                              className="btn btn-sm"
+                              style={{
+                                background: 'rgba(239,68,68,0.15)',
+                                color: C.redLight,
+                                border: `1px solid ${C.redBorder}`,
+                                fontSize: 11,
+                                fontWeight: 700,
+                                padding: '4px 9px'
+                              }}
+                              title="فك إسناد هذا الشات وإعادته للانتظار في Chatwoot فوراً"
+                            >
+                              <span>📥</span>
+                              <span>للانتظار</span>
+                            </button>
+                          </div>
                         </td>
                       </tr>
                     );

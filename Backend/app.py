@@ -1374,7 +1374,8 @@ def _extract_agent_assign_Info(messages_list, ag_name="", avail_name="", team_na
 def _check_if_fast_reply_5m(conv, cid_str, aid, assigned_ts_map, assigned_ts_by_cid, now_ts):
     """
     Determines if an answered/exempt open conversation was replied to within 5 minutes (<= 300s)
-    from when it was assigned to the agent (or from customer's message).
+    from when it was assigned to the human agent (or from customer's message to the agent).
+    Does NOT use (first_reply_created_at - created_at) because the AI bot sends the initial greeting at creation.
     """
     cache_key = f"{cid_str}_{aid}"
     with _chat_tracker_lock:
@@ -1385,8 +1386,6 @@ def _check_if_fast_reply_5m(conv, cid_str, aid, assigned_ts_map, assigned_ts_by_
     msgs = conv.get("messages") or []
     last_m = msgs[-1] if msgs else {}
     reply_ts = int(last_m.get("created_at") or lnm.get("created_at") or conv.get("last_activity_at") or 0)
-    fr_ts = int(conv.get("first_reply_created_at") or 0)
-    cr_ts = int(conv.get("created_at") or 0)
 
     # 1. Check against previously tracked effective_waiting_since
     with _chat_tracker_lock:
@@ -1405,19 +1404,11 @@ def _check_if_fast_reply_5m(conv, cid_str, aid, assigned_ts_map, assigned_ts_by_
         assigned_ts_by_cid.get(cid_str, 0),
         cached_assign
     )
-    if assigned_ts:
-        if (reply_ts and reply_ts >= assigned_ts and (reply_ts - assigned_ts) <= 300) or (
-            fr_ts and fr_ts >= assigned_ts and (fr_ts - assigned_ts) <= 300
-        ):
+    if assigned_ts and reply_ts and reply_ts >= assigned_ts:
+        if (reply_ts - assigned_ts) <= 300:
             with _chat_tracker_lock:
                 _chat_fast_reply_cache[cache_key] = True
             return True
-
-    # 3. Check Chatwoot first_reply_created_at vs created_at
-    if fr_ts and cr_ts and fr_ts >= cr_ts and (fr_ts - cr_ts) <= 300:
-        with _chat_tracker_lock:
-            _chat_fast_reply_cache[cache_key] = True
-        return True
 
     return False
 
@@ -1428,11 +1419,15 @@ def _build_delays_report(num_pages=0):
     - Delay strictly from max(waiting_since, agent_assigned_ts) so no agent is ever penalized
       for time before the chat was assigned to them.
     - Smart exemptions (private notes, courtesy closings, likes/stickers).
-    - Full open chats count & speed_score per agent.
+    - Full open chats count & speed_score per agent (only counting today's active chats for positive points
+      so hoarding old un-resolved chats from previous days does not inflate score).
     """
     import math
     base_url, token, account_id = get_cw_config()
     headers = _cw_headers()
+
+    now_cairo = datetime.now(CAIRO_TZ)
+    today_start_ts = int(now_cairo.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
 
     all_agents = database.get_all_agents()
     agents_map = {str(a["id"]): dict(a) for a in all_agents}
@@ -1751,25 +1746,27 @@ def _build_delays_report(num_pages=0):
                 agent_stats[aid]["exempt_count"] += 1
                 total_exempt_chats += 1
 
-            is_fast_5m = _check_if_fast_reply_5m(conv, cid_str, aid, assigned_ts_map, assigned_ts_by_cid, now_ts)
-            if is_fast_5m:
-                agent_stats[aid]["fast_5m_count"] += 1
-                agent_stats[aid]["speed_score"] += 2
-            else:
-                agent_stats[aid]["within_15m_count"] += 1
-                agent_stats[aid]["speed_score"] += 1
+            # Only award positive points for conversations active today (or in last 16h) so old stale open chats don't inflate score
+            last_act_ts = int(conv.get("last_activity_at") or conv.get("updated_at") or 0)
+            is_active_today = (last_act_ts >= today_start_ts) or ((now_ts - last_act_ts) <= 16 * 3600)
 
-    # Sync with official Chatwoot open_counts if full scan was performed (num_pages == 0)
+            if is_active_today:
+                is_fast_5m = _check_if_fast_reply_5m(conv, cid_str, aid, assigned_ts_map, assigned_ts_by_cid, now_ts)
+                if is_fast_5m:
+                    agent_stats[aid]["fast_5m_count"] += 1
+                    agent_stats[aid]["speed_score"] += 2
+                else:
+                    agent_stats[aid]["within_15m_count"] += 1
+                    agent_stats[aid]["speed_score"] += 1
+
+    # Sync open_chats_count display with official Chatwoot open_counts if full scan was performed (num_pages == 0)
     if not num_pages or num_pages <= 0:
         try:
             official_open = fetch_agent_report_counts()
             for aid, ag_st in agent_stats.items():
                 off_cnt = int(official_open.get(aid) or 0)
                 if off_cnt > ag_st["open_chats_count"]:
-                    diff_open = off_cnt - ag_st["open_chats_count"]
                     ag_st["open_chats_count"] = off_cnt
-                    ag_st["within_15m_count"] += diff_open
-                    ag_st["speed_score"] += diff_open
         except Exception:
             pass
 
@@ -1791,8 +1788,10 @@ def _build_delays_report(num_pages=0):
         most_delayed = f"{top_ag['agent_name']} ({top_ag['pending_count']} معلقة)"
 
     top_scored_agent = "لا يوجد"
-    if agents_list:
-        best_ag = max(agents_list, key=lambda a: a["speed_score"])
+    sales_agents_list = [a for a in agents_list if a.get("is_mapped_sales") or a.get("team") == "Sales"]
+    candidate_pool = sales_agents_list if sales_agents_list else agents_list
+    if candidate_pool:
+        best_ag = max(candidate_pool, key=lambda a: a["speed_score"])
         top_scored_agent = f"{best_ag['agent_name']} ({best_ag['speed_score']} نقطة)"
 
     longest_delay_formatted = "0 دقيقة"

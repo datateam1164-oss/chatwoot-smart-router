@@ -394,10 +394,10 @@ export const agentsApi = {
     return res.json();
   },
 
-  async fetchDelaysReport(refresh = false, pages = 6) {
+  async fetchDelaysReport(refresh = false, pages = 0) {
     const query = new URLSearchParams();
     if (refresh) query.set('refresh', 'true');
-    if (pages) query.set('pages', String(pages));
+    query.set('pages', String(pages ?? 0));
     const res = await apiFetch(`/reports/delays?${query.toString()}`);
     if (!res.ok) throw new Error('فشل جلب تقرير التأخيرات');
     return res.json();

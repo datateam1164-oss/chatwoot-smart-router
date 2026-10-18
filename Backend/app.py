@@ -1315,118 +1315,291 @@ def _is_chat_delay_exempt(conv):
     return False, ""
 
 
-def _check_if_fast_reply_5m(conv, cid_str, assigned_ts_map, now_ts):
+_chat_wait_tracker = {}
+_chat_fast_reply_cache = {}
+_chat_assignment_cache = {}
+_chat_tracker_lock = threading.Lock()
+
+
+def _extract_agent_assign_Info(messages_list, ag_name="", avail_name="", team_name=""):
     """
-    Determines if an answered/exempt open conversation was replied to within 5 minutes (<= 300s).
+    Scans a Chatwoot messages list to find:
+    1. Latest timestamp when the conversation was assigned to this agent (assign_ts).
+    2. Whether the last non-activity message (or private note) in the full list is from the agent (agent_handled).
     """
+    if not messages_list or not isinstance(messages_list, list):
+        return 0, False
+
+    ag_norm = " ".join((ag_name or "").strip().lower().split())
+    av_norm = " ".join((avail_name or "").strip().lower().split())
+    tm_norm = " ".join((team_name or "").strip().lower().split())
+
+    latest_assign_ts = 0
+    last_human_msg = None
+
+    for m in messages_list:
+        if not isinstance(m, dict):
+            continue
+        mtype = m.get("message_type")
+        is_priv = bool(m.get("private"))
+        cts = int(m.get("created_at") or 0)
+
+        if is_priv or mtype in (0, 1):
+            if last_human_msg is None or cts >= int(last_human_msg.get("created_at") or 0):
+                last_human_msg = m
+
+        if mtype == 2:
+            txt_norm = " ".join((m.get("content") or "").strip().lower().split())
+            if "assigned to " in txt_norm:
+                matched_agent = False
+                if ag_norm and ag_norm in txt_norm:
+                    matched_agent = True
+                elif av_norm and av_norm in txt_norm:
+                    matched_agent = True
+                elif not tm_norm or f"assigned to {tm_norm}" not in txt_norm:
+                    # Fallback if agent display name changed: any 'assigned to X' that isn't the team name
+                    matched_agent = True
+
+                if matched_agent and cts > latest_assign_ts:
+                    latest_assign_ts = cts
+
+    agent_handled = False
+    if last_human_msg is not None:
+        if last_human_msg.get("private") is True or last_human_msg.get("message_type") == 1:
+            agent_handled = True
+
+    return latest_assign_ts, agent_handled
+
+
+def _check_if_fast_reply_5m(conv, cid_str, aid, assigned_ts_map, assigned_ts_by_cid, now_ts):
+    """
+    Determines if an answered/exempt open conversation was replied to within 5 minutes (<= 300s)
+    from when it was assigned to the agent (or from customer's message).
+    """
+    cache_key = f"{cid_str}_{aid}"
     with _chat_tracker_lock:
-        if _chat_fast_reply_cache.get(cid_str):
+        if _chat_fast_reply_cache.get(cache_key) or _chat_fast_reply_cache.get(cid_str):
             return True
 
     lnm = conv.get("last_non_activity_message") or {}
     msgs = conv.get("messages") or []
     last_m = msgs[-1] if msgs else {}
-    reply_ts = last_m.get("created_at") or lnm.get("created_at") or conv.get("last_activity_at") or 0
+    reply_ts = int(last_m.get("created_at") or lnm.get("created_at") or conv.get("last_activity_at") or 0)
+    fr_ts = int(conv.get("first_reply_created_at") or 0)
+    cr_ts = int(conv.get("created_at") or 0)
 
-    # 1. Check against previously tracked waiting_since
+    # 1. Check against previously tracked effective_waiting_since
     with _chat_tracker_lock:
-        prev_ws = _chat_wait_tracker.get(cid_str)
+        prev_ws = _chat_wait_tracker.get(cache_key) or _chat_wait_tracker.get(cid_str)
+        cached_assign = (_chat_assignment_cache.get((cid_str, aid)) or {}).get("assign_ts", 0)
         if prev_ws and reply_ts and reply_ts >= prev_ws:
             if (reply_ts - prev_ws) <= 300:
-                _chat_fast_reply_cache[cid_str] = True
+                _chat_fast_reply_cache[cache_key] = True
                 return True
             else:
                 return False
 
-    # 2. Check against router assignment timestamp if available
-    assigned_ts = assigned_ts_map.get(cid_str)
-    if assigned_ts and reply_ts and reply_ts >= assigned_ts:
-        if (reply_ts - assigned_ts) <= 300:
+    # 2. Check against router/Chatwoot assignment timestamp if available
+    assigned_ts = max(
+        assigned_ts_map.get((cid_str, aid), 0),
+        assigned_ts_by_cid.get(cid_str, 0),
+        cached_assign
+    )
+    if assigned_ts:
+        if (reply_ts and reply_ts >= assigned_ts and (reply_ts - assigned_ts) <= 300) or (
+            fr_ts and fr_ts >= assigned_ts and (fr_ts - assigned_ts) <= 300
+        ):
             with _chat_tracker_lock:
-                _chat_fast_reply_cache[cid_str] = True
+                _chat_fast_reply_cache[cache_key] = True
             return True
 
     # 3. Check Chatwoot first_reply_created_at vs created_at
-    fr_ts = conv.get("first_reply_created_at") or 0
-    cr_ts = conv.get("created_at") or 0
     if fr_ts and cr_ts and fr_ts >= cr_ts and (fr_ts - cr_ts) <= 300:
         with _chat_tracker_lock:
-            _chat_fast_reply_cache[cid_str] = True
+            _chat_fast_reply_cache[cache_key] = True
         return True
 
     return False
 
 
-def _build_delays_report(num_pages=6):
+def _build_delays_report(num_pages=0):
+    """
+    Fetches ALL open assigned conversations (or num_pages if > 0) and calculates:
+    - Delay strictly from max(waiting_since, agent_assigned_ts) so no agent is ever penalized
+      for time before the chat was assigned to them.
+    - Smart exemptions (private notes, courtesy closings, likes/stickers).
+    - Full open chats count & speed_score per agent.
+    """
+    import math
     base_url, token, account_id = get_cw_config()
     headers = _cw_headers()
-    
+
     all_agents = database.get_all_agents()
     agents_map = {str(a["id"]): dict(a) for a in all_agents}
     all_mappings = database.get_all_mappings()
     mapping_dict = {str(m["chatwoot_agent_id"]): m["crm_name"] for m in all_mappings if m.get("chatwoot_agent_id")}
 
-    # Load recent assignment timestamps from chats_log for fast-reply (<5m) verification
-    assigned_ts_map = {}
+    # Load assignment timestamps from local SQLite chats_log
+    assigned_ts_map = {}     # (cid_str, aid) -> latest assigned_ts
+    assigned_ts_by_cid = {}  # cid_str -> latest assigned_ts
     try:
         conn = database.get_db()
         cur = conn.cursor()
-        cur.execute("SELECT conv_id, assigned_at FROM chats_log WHERE id > (SELECT COALESCE(MAX(id), 0) - 3000 FROM chats_log)")
+        cur.execute("SELECT conv_id, agent_id, assigned_at FROM chats_log WHERE id > (SELECT COALESCE(MAX(id), 0) - 10000 FROM chats_log)")
         for r in cur.fetchall():
             if r["conv_id"] and r["assigned_at"]:
                 try:
-                    assigned_ts_map[str(r["conv_id"])] = int(datetime.fromisoformat(r["assigned_at"]).timestamp())
+                    ts_val = int(datetime.fromisoformat(r["assigned_at"]).timestamp())
+                    c_str = str(r["conv_id"])
+                    a_str = str(r["agent_id"] or "")
+                    if ts_val > assigned_ts_by_cid.get(c_str, 0):
+                        assigned_ts_by_cid[c_str] = ts_val
+                    if a_str and ts_val > assigned_ts_map.get((c_str, a_str), 0):
+                        assigned_ts_map[(c_str, a_str)] = ts_val
                 except Exception:
                     pass
         conn.close()
     except Exception:
         pass
-    
-    def _fetch_page(p):
+
+    # Pooled HTTP session for fast parallel fetching of all pages
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(pool_connections=25, pool_maxsize=25, max_retries=2)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update(headers)
+
+    def _fetch_page_with_meta(p):
         url = f"{base_url}/api/v1/accounts/{account_id}/conversations"
-        try:
-            res = requests.get(
-                url, 
-                params={"status": "open", "assignee_type": "assigned", "page": p}, 
-                headers=headers, 
-                timeout=12
-            )
-            if res.status_code == 200:
-                data = res.json()
-                return data.get("data", {}).get("payload", [])
-        except Exception as err:
-            logger.warning(f"⚠️ Error fetching conversations page {p}: {err}")
-        return []
+        for attempt in range(2):
+            try:
+                res = session.get(
+                    url,
+                    params={"status": "open", "assignee_type": "assigned", "page": p},
+                    timeout=14
+                )
+                if res.status_code == 200:
+                    data = res.json().get("data", {})
+                    return data.get("payload", []), data.get("meta", {})
+            except Exception as err:
+                if attempt == 1:
+                    logger.warning(f"⚠️ Error fetching conversations page {p}: {err}")
+                time.sleep(0.15)
+        return [], {}
 
     t0 = time.time()
+    first_payload, meta_info = _fetch_page_with_meta(1)
+    raw_convs = list(first_payload)
+
+    total_assigned_meta = int(meta_info.get("assigned_count") or 0)
+    if num_pages and num_pages > 0:
+        target_pages = max(1, min(int(num_pages), 100))
+    else:
+        # Fetch ALL open assigned conversations across all pages
+        calc_pages = math.ceil(total_assigned_meta / 25.0) if total_assigned_meta > 0 else 40
+        target_pages = max(1, min(calc_pages, 100))
+
+    if target_pages > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(target_pages - 1, 20)) as executor:
+            results = executor.map(lambda p: _fetch_page_with_meta(p)[0], range(2, target_pages + 1))
+            for page_convs in results:
+                if page_convs:
+                    raw_convs.extend(page_convs)
+
+    # Deduplicate conversations by ID (in case pagination shifted slightly while fetching)
     all_convs = []
-    num_pages = max(1, min(num_pages, 80))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(num_pages, 16)) as executor:
-        results = executor.map(_fetch_page, range(1, num_pages + 1))
-        for page_convs in results:
-            all_convs.extend(page_convs)
-            
+    seen_conv_ids = set()
+    for c in raw_convs:
+        cid_val = c.get("id")
+        if cid_val and cid_val not in seen_conv_ids:
+            seen_conv_ids.add(cid_val)
+            all_convs.append(c)
+
+    now_ts = int(time.time())
+
+    # Pre-identify non-exempt waiting conversations that need exact assignment timestamp verification from /messages
+    waiting_candidates = []
+    for conv in all_convs:
+        ws = int(conv.get("waiting_since") or 0)
+        if ws <= 0:
+            continue
+        is_ex, _ = _is_chat_delay_exempt(conv)
+        if is_ex:
+            continue
+
+        cid_str = str(conv.get("id"))
+        assignee = (conv.get("meta", {}) or {}).get("assignee", {}) or {}
+        aid = str(assignee.get("id", ""))
+        ag_db = agents_map.get(aid, {})
+        ag_name = ag_db.get("name") or assignee.get("name") or ""
+        avail_name = assignee.get("available_name") or ""
+        team_name = ((conv.get("meta", {}) or {}).get("team") or {}).get("name") or ""
+        act_ts = int(conv.get("last_activity_at") or 0)
+
+        # Check inline messages first
+        inline_assign_ts, inline_handled = _extract_agent_assign_Info(
+            conv.get("messages") or [], ag_name, avail_name, team_name
+        )
+        if inline_assign_ts > 0:
+            with _chat_tracker_lock:
+                prev_c = _chat_assignment_cache.get((cid_str, aid), {})
+                if inline_assign_ts >= prev_c.get("assign_ts", 0):
+                    _chat_assignment_cache[(cid_str, aid)] = {
+                        "assign_ts": inline_assign_ts,
+                        "agent_handled": inline_handled,
+                        "act_ts": act_ts
+                    }
+
+        with _chat_tracker_lock:
+            cached_info = _chat_assignment_cache.get((cid_str, aid))
+
+        # Fetch /conversations/{cid}/messages if not cached for current activity timestamp
+        if not cached_info or cached_info.get("act_ts") != act_ts:
+            waiting_candidates.append((cid_str, aid, ag_name, avail_name, team_name, act_ts))
+
+    def _inspect_conv_messages(item):
+        c_str, a_id, a_name, av_name, tm_name, a_ts = item
+        url = f"{base_url}/api/v1/accounts/{account_id}/conversations/{c_str}/messages"
+        try:
+            r = session.get(url, timeout=10)
+            if r.status_code == 200:
+                msgs_payload = r.json().get("payload", [])
+                assign_ts, handled = _extract_agent_assign_Info(msgs_payload, a_name, av_name, tm_name)
+                with _chat_tracker_lock:
+                    prev_assign = (_chat_assignment_cache.get((c_str, a_id)) or {}).get("assign_ts", 0)
+                    _chat_assignment_cache[(c_str, a_id)] = {
+                        "assign_ts": max(assign_ts, prev_assign),
+                        "agent_handled": handled,
+                        "act_ts": a_ts
+                    }
+        except Exception as e:
+            logger.debug(f"Could not fetch messages for waiting conv {c_str}: {e}")
+
+    if waiting_candidates:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(waiting_candidates), 16)) as executor:
+            list(executor.map(_inspect_conv_messages, waiting_candidates))
+
     dur = time.time() - t0
     now_ts = int(time.time())
-    
+
     pending_chats = []
     agent_stats = {}
     total_exempt_chats = 0
-    
+
     for conv in all_convs:
         cid = conv.get("id")
         cid_str = str(cid)
         assignee = (conv.get("meta", {}) or {}).get("assignee", {}) or {}
         aid = str(assignee.get("id", ""))
         ag_db = agents_map.get(aid, {})
-        
+
         ag_name = ag_db.get("name") or assignee.get("name") or "غير محدد"
         crm_name = ag_db.get("crm_name") or mapping_dict.get(aid) or ""
         is_mapped_sales = bool(crm_name and str(crm_name).strip())
         team = ag_db.get("team") or ("Sales" if is_mapped_sales else "CS")
         in_shift = _agent_in_shift_hours(ag_db) if ag_db else False
         in_grace = (_agent_in_grace_period(ag_db) and in_shift) if ag_db else False
-        
+
         if aid not in agent_stats:
             agent_stats[aid] = {
                 "agent_id": aid,
@@ -1453,22 +1626,40 @@ def _build_delays_report(num_pages=6):
             }
 
         agent_stats[aid]["open_chats_count"] += 1
-        
-        waiting_since = conv.get("waiting_since") or 0
+
+        waiting_since = int(conv.get("waiting_since") or 0)
         is_exempt, exempt_reason = (False, "")
-        if waiting_since and waiting_since > 0:
+        if waiting_since > 0:
             is_exempt, exempt_reason = _is_chat_delay_exempt(conv)
 
-        if waiting_since and waiting_since > 0 and not is_exempt:
-            # Track active waiting_since so we can measure reply speed when agent responds
+        with _chat_tracker_lock:
+            cached_info = _chat_assignment_cache.get((cid_str, aid)) or {}
+
+        if not is_exempt and cached_info.get("agent_handled"):
+            is_exempt = True
+            exempt_reason = "agent_handled"
+
+        if waiting_since > 0 and not is_exempt:
+            # Determine exact timestamp when this chat was assigned to this agent
+            agent_assigned_ts = max(
+                assigned_ts_map.get((cid_str, aid), 0),
+                assigned_ts_by_cid.get(cid_str, 0),
+                int(cached_info.get("assign_ts") or 0)
+            )
+            # Effective waiting start is NEVER before the chat was assigned to this agent
+            effective_waiting_since = max(waiting_since, agent_assigned_ts)
+
+            cache_key = f"{cid_str}_{aid}"
             with _chat_tracker_lock:
-                _chat_wait_tracker[cid_str] = waiting_since
+                _chat_wait_tracker[cache_key] = effective_waiting_since
+                _chat_wait_tracker[cid_str] = effective_waiting_since
+                _chat_fast_reply_cache.pop(cache_key, None)
                 _chat_fast_reply_cache.pop(cid_str, None)
 
-            delay_sec = max(0, now_ts - waiting_since)
+            delay_sec = max(0, now_ts - effective_waiting_since)
             delay_min = round(delay_sec / 60.0, 1)
-            
-            # Score & severity calculation on genuinely waiting chats:
+
+            # Score & severity calculation on genuinely waiting chats (measured from assignment/message):
             # < 15 min: +1 point
             # 15 - 29.9 min: -1 point
             # 30 - 44.9 min: -2 points
@@ -1503,7 +1694,7 @@ def _build_delays_report(num_pages=6):
                 agent_stats[aid]["within_15m_count"] += 1
                 agent_stats[aid]["speed_score"] += 1
                 chat_points = 1
-                
+
             agent_stats[aid]["pending_count"] += 1
             if delay_min > agent_stats[aid]["max_delay_minutes"]:
                 agent_stats[aid]["max_delay_minutes"] = delay_min
@@ -1515,7 +1706,7 @@ def _build_delays_report(num_pages=6):
                     hrs = int(delay_min // 60)
                     mns = int(delay_min % 60)
                     agent_stats[aid]["max_delay_text"] = f"{hrs} س و {mns} د"
-            
+
             # Format waiting text
             if delay_min < 1:
                 wait_text = "أقل من دقيقة"
@@ -1525,18 +1716,20 @@ def _build_delays_report(num_pages=6):
                 hrs = int(delay_min // 60)
                 mns = int(delay_min % 60)
                 wait_text = f"منذ {hrs} ساعة و {mns} دقيقة"
-                
+
             sender = (conv.get("meta", {}) or {}).get("sender", {}) or {}
             last_msg_obj = conv.get("last_non_activity_message") or {}
             last_msg = last_msg_obj.get("content") or ""
-            
+
             customer_name = sender.get("name") or sender.get("identifier") or "عميل بدون اسم"
             customer_phone = sender.get("phone_number") or ""
-            
+
             pending_chats.append({
                 "conv_id": cid,
                 "chatwoot_url": f"{base_url}/app/accounts/{account_id}/conversations/{cid}",
-                "waiting_since": waiting_since,
+                "waiting_since": effective_waiting_since,
+                "raw_waiting_since": waiting_since,
+                "assigned_at_ts": agent_assigned_ts,
                 "waiting_since_text": wait_text,
                 "delay_minutes": delay_min,
                 "severity": severity,
@@ -1558,7 +1751,7 @@ def _build_delays_report(num_pages=6):
                 agent_stats[aid]["exempt_count"] += 1
                 total_exempt_chats += 1
 
-            is_fast_5m = _check_if_fast_reply_5m(conv, cid_str, assigned_ts_map, now_ts)
+            is_fast_5m = _check_if_fast_reply_5m(conv, cid_str, aid, assigned_ts_map, assigned_ts_by_cid, now_ts)
             if is_fast_5m:
                 agent_stats[aid]["fast_5m_count"] += 1
                 agent_stats[aid]["speed_score"] += 2
@@ -1566,17 +1759,31 @@ def _build_delays_report(num_pages=6):
                 agent_stats[aid]["within_15m_count"] += 1
                 agent_stats[aid]["speed_score"] += 1
 
+    # Sync with official Chatwoot open_counts if full scan was performed (num_pages == 0)
+    if not num_pages or num_pages <= 0:
+        try:
+            official_open = fetch_agent_report_counts()
+            for aid, ag_st in agent_stats.items():
+                off_cnt = int(official_open.get(aid) or 0)
+                if off_cnt > ag_st["open_chats_count"]:
+                    diff_open = off_cnt - ag_st["open_chats_count"]
+                    ag_st["open_chats_count"] = off_cnt
+                    ag_st["within_15m_count"] += diff_open
+                    ag_st["speed_score"] += diff_open
+        except Exception:
+            pass
+
     # Sort pending chats by delay descending (longest delay first)
     pending_chats.sort(key=lambda x: x["delay_minutes"], reverse=True)
-    
+
     # Sort agents summary by speed_score descending (highest score first), then open chats descending
     agents_list = list(agent_stats.values())
     agents_list.sort(key=lambda a: (a["speed_score"], a["open_chats_count"], -a["critical_count"]), reverse=True)
-    
+
     critical_total = sum(1 for c in pending_chats if c["severity"] == "critical")
     warning_total = sum(1 for c in pending_chats if c["severity"] == "warning")
     normal_total = sum(1 for c in pending_chats if c["severity"] == "normal")
-    
+
     most_delayed = "لا يوجد"
     delayed_sorted = sorted(agents_list, key=lambda a: (a["critical_count"], a["pending_count"], a["max_delay_minutes"]), reverse=True)
     if delayed_sorted and delayed_sorted[0]["pending_count"] > 0:
@@ -1621,24 +1828,24 @@ def _build_delays_report(num_pages=6):
 @app.route('/api/reports/delays', methods=['GET'])
 def api_reports_delays():
     refresh = request.args.get('refresh', 'false').lower() in ['true', '1', 'yes']
-    pages = request.args.get('pages', 6)
+    pages = request.args.get('pages', 0)
     try:
         pages = int(pages)
     except (ValueError, TypeError):
-        pages = 6
-        
+        pages = 0
+
     now = time.time()
     with delays_cache_lock:
         if not refresh and delays_cache.get("data") is not None:
-            if delays_cache.get("pages") == pages and (now - delays_cache.get("cached_at", 0) < 20):  # 20 seconds TTL
+            if delays_cache.get("pages") == pages and (now - delays_cache.get("cached_at", 0) < 25):  # 25 seconds TTL
                 return jsonify(delays_cache["data"])
-                
+
     report_data = _build_delays_report(num_pages=pages)
     with delays_cache_lock:
         delays_cache["data"] = report_data
         delays_cache["cached_at"] = now
         delays_cache["pages"] = pages
-        
+
     return jsonify(report_data)
 
 @app.route('/api/conversations/<conv_id>/unassign', methods=['POST'])

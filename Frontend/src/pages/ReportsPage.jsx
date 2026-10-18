@@ -16,7 +16,7 @@ export default function ReportsPage() {
   const [severityFilter, setSeverityFilter] = useState('all'); // 'all', 'critical', 'warning', 'normal'
   const [activeTab, setActiveTab] = useState('chats'); // 'chats' or 'agents'
   const [agentSortBy, setAgentSortBy] = useState('score_desc'); // 'score_desc' or 'delay_desc'
-  const [scanPages, setScanPages] = useState(6);
+  const [scanPages, setScanPages] = useState(0); // 0 = Fetch ALL open assigned chats across all pages
   const [autoRefresh, setAutoRefresh] = useState(false);
 
 
@@ -321,11 +321,11 @@ export default function ReportsPage() {
                 cursor: 'pointer'
               }}
             >
-              <option value={6} style={{ background: C.bgLight, color: C.text }}>150 شات (6 صفحات - سريع)</option>
+              <option value={0} style={{ background: C.bgLight, color: C.text }}>🌟 كل الشاتات المفتوحة بالكامل (100%)</option>
               <option value={12} style={{ background: C.bgLight, color: C.text }}>300 شات (12 صفحة)</option>
               <option value={24} style={{ background: C.bgLight, color: C.text }}>600 شات (24 صفحة)</option>
               <option value={48} style={{ background: C.bgLight, color: C.text }}>1200 شات (48 صفحة)</option>
-              <option value={75} style={{ background: C.bgLight, color: C.text }}>🌟 شاتات اليوم كله (حتى 1800+ شات)</option>
+              <option value={6} style={{ background: C.bgLight, color: C.text }}>150 شات (6 صفحات - سريع)</option>
             </select>
           </div>
 
@@ -969,6 +969,11 @@ export default function ReportsPage() {
                           <div style={{ fontSize: 10, color: C.textDim }}>
                             ({chat.delay_minutes} دقيقة)
                           </div>
+                          {chat.assigned_at_ts > 0 && chat.raw_waiting_since > 0 && chat.assigned_at_ts > chat.raw_waiting_since && (
+                            <div style={{ fontSize: 10, color: C.accent, marginTop: 2, fontWeight: 600 }}>
+                              ⏱️ من لحظة التوزيع على الموظف
+                            </div>
+                          )}
                         </td>
 
                         {/* Severity Badge & Points Impact */}

@@ -1171,6 +1171,169 @@ def api_agent_chats(agent_id):
 
 # ── Reports & Delay Monitoring ───────────────────────────────────────────────
 
+_chat_wait_tracker = {}
+_chat_fast_reply_cache = {}
+_chat_tracker_lock = threading.Lock()
+
+def _is_chat_delay_exempt(conv):
+    """
+    Returns (is_exempt: bool, reason_code: str)
+    Exempts conversations where:
+    1. Agent wrote a Private Note (private=True) or last message is from the agent (message_type=1).
+    2. Customer sent a courtesy/closing message ('تمام', 'شكرا', 'ماشي', 'هشوف واكلمك', etc.) without an inquiry.
+    3. Customer sent only an emoji/like (👍, ❤️, etc.) or sticker without inquiry text.
+    """
+    lnm = conv.get("last_non_activity_message") or {}
+    msgs = conv.get("messages") or []
+    last_m = msgs[-1] if msgs else {}
+
+    # 1. Private note or agent already replied
+    if lnm.get("private") is True or last_m.get("private") is True:
+        return True, "private_note"
+    if lnm.get("message_type") == 1:
+        return True, "agent_replied"
+    if last_m.get("message_type") == 1:
+        last_m_ts = last_m.get("created_at") or 0
+        lnm_ts = lnm.get("created_at") or 0
+        if last_m_ts >= lnm_ts:
+            return True, "agent_replied"
+
+    # 2. Check customer message content & attachments
+    content = (lnm.get("content") or "").strip()
+    content_type = str(lnm.get("content_type") or "").lower()
+    attachments = lnm.get("attachments") or []
+
+    if content_type == "sticker":
+        return True, "sticker"
+
+    if attachments:
+        all_stickers = True
+        for att in attachments:
+            ft = str(att.get("file_type") or "").lower()
+            durl = str(att.get("data_url") or "").lower()
+            if ft == "sticker" or durl.endswith(".webp"):
+                continue
+            all_stickers = False
+            break
+        if all_stickers and not content:
+            return True, "sticker"
+        if not all_stickers:
+            return False, ""
+
+    if not content:
+        return True, "sticker_or_reaction"
+
+    # Check if message is purely emojis / symbols / likes
+    text_clean = re.sub(r'[^\w\s]', ' ', content).strip().lower()
+    text_clean = re.sub(r'\s+', ' ', text_clean)
+    if not text_clean:
+        return True, "emoji_like"
+
+    text_norm = (
+        text_clean.replace('أ', 'ا')
+        .replace('إ', 'ا')
+        .replace('آ', 'ا')
+        .replace('ة', 'ه')
+        .replace('ى', 'ي')
+        .replace('ً', '')
+    )
+
+    explicit_closing_phrases = [
+        'لا شكرا', 'مش عايزين نشترك', 'مش عاوزين نشترك', 'مش محتاج حاجه', 'مش محتاج',
+        'هشوف كده وكلمك', 'هشوف كدا وكلمك', 'هشوف واكلمك', 'هكلم حضرتك تاني', 'هكلمك تاني',
+        'هرجع لحضرتك', 'هسال وارد عليك', 'خلاص مش محتاج', 'شكرا مش محتاج'
+    ]
+    for ecp in explicit_closing_phrases:
+        if ecp in text_norm and len(text_norm) <= len(ecp) + 18:
+            return True, "courtesy_closing"
+
+    inquiry_indicators = [
+        '؟', '?', 'بكام', 'كام', 'سعر', 'اسعار', 'اشتراك', 'اشترك', 'باقه', 'باقات',
+        'عرض', 'عروض', 'خصم', 'تخفيض', 'تفاصيل', 'ازاي', 'كيف', 'طريقه', 'ادفع', 'دفع',
+        'فودافون', 'انستا', 'فوري', 'كود', 'رقم', 'لينك', 'رابط', 'تسجيل', 'سنتر',
+        'منصه', 'حجز', 'احجز', 'هاحجز', 'هحجز', 'عايز', 'عاوز', 'محتاج', 'ليه',
+        'امتي', 'متي', 'فين', 'ممكن', 'ينفع', 'رد', 'حد يرد', 'انتوا فين', 'مشكله',
+        'شحن', 'تفعيل', 'شرح', 'مواد', 'عربي', 'لغات', 'ثانوي', 'اعدادي', 'ابتدائي'
+    ]
+    if any(ind in content.lower() or ind in text_norm for ind in inquiry_indicators):
+        return False, ""
+
+    digits_count = sum(1 for ch in content if ch.isdigit())
+    if digits_count >= 4:
+        return False, ""
+
+    courtesy_phrases = {
+        'تمام', 'ماشي', 'شكرا', 'اشكرك', 'تسلم', 'تسلمي', 'الف شكر', 'شكرا جدا',
+        'شكرا جزيلا', 'شكرا لحضرتك', 'شكرا يا فندم', 'تسلم يا غالي', 'تسلم ايدك',
+        'تسلم يا باشا', 'شكرا ليك', 'شكرا ليكي', 'تمام يا فندم', 'تمام ماشي',
+        'ماشي تمام', 'خلاص تمام', 'اوك تمام', 'تمام اوك', 'اوكي تمام', 'اوكيه',
+        'اوكي', 'اوك', 'ok', 'okay', 'k', 'thanks', 'thank you', 'thx', 'ty', 'like',
+        'جزاك الله خيرا', 'ربنا يخليك', 'ربنا يباركلك', 'تمام فهمت', 'فهمت خلاص',
+        'فهمت', 'وصلت', 'كده تمام', 'كدا تمام', 'تمام كدا', 'تمام كده', 'كله تمام',
+        'مفيش مشكله', 'ولا يهمك', 'حبيبي تسلم', 'عفوا', 'سلام', 'مع السلامه', 'باي',
+        'bye', 'خلاص', 'حاضر', 'طيب', 'طيب تمام', 'ماشي شكرا', 'تمام ماشي شكرا',
+        'تمام شكرا', 'شكرا تمام', 'ان شاء الله', 'باذن الله', 'بالتوفيق', 'حبيبي', 'تمام تسلم'
+    }
+
+    if text_norm in courtesy_phrases:
+        return True, "courtesy_closing"
+
+    words = text_norm.split()
+    courtesy_words = {
+        'تمام', 'ماشي', 'شكرا', 'اشكرك', 'تسلم', 'تسلمي', 'الف', 'شكر', 'جدا', 'جزيلا',
+        'لحضرتك', 'يا', 'فندم', 'غالي', 'ايدك', 'باشا', 'ليك', 'ليكي', 'خلاص', 'اوك',
+        'اوكي', 'اوكيه', 'ok', 'okay', 'thanks', 'thank', 'you', 'thx', 'جزاك', 'الله',
+        'خيرا', 'ربنا', 'يخليك', 'يباركلك', 'فهمت', 'وصلت', 'كده', 'كدا', 'كله', 'حاضر',
+        'طيب', 'عفوا', 'سلام', 'باي', 'حبيبي', 'ان', 'شاء', 'باذن'
+    }
+    if 1 <= len(words) <= 5 and all(w in courtesy_words for w in words):
+        return True, "courtesy_closing"
+
+    return False, ""
+
+
+def _check_if_fast_reply_5m(conv, cid_str, assigned_ts_map, now_ts):
+    """
+    Determines if an answered/exempt open conversation was replied to within 5 minutes (<= 300s).
+    """
+    with _chat_tracker_lock:
+        if _chat_fast_reply_cache.get(cid_str):
+            return True
+
+    lnm = conv.get("last_non_activity_message") or {}
+    msgs = conv.get("messages") or []
+    last_m = msgs[-1] if msgs else {}
+    reply_ts = last_m.get("created_at") or lnm.get("created_at") or conv.get("last_activity_at") or 0
+
+    # 1. Check against previously tracked waiting_since
+    with _chat_tracker_lock:
+        prev_ws = _chat_wait_tracker.get(cid_str)
+        if prev_ws and reply_ts and reply_ts >= prev_ws:
+            if (reply_ts - prev_ws) <= 300:
+                _chat_fast_reply_cache[cid_str] = True
+                return True
+            else:
+                return False
+
+    # 2. Check against router assignment timestamp if available
+    assigned_ts = assigned_ts_map.get(cid_str)
+    if assigned_ts and reply_ts and reply_ts >= assigned_ts:
+        if (reply_ts - assigned_ts) <= 300:
+            with _chat_tracker_lock:
+                _chat_fast_reply_cache[cid_str] = True
+            return True
+
+    # 3. Check Chatwoot first_reply_created_at vs created_at
+    fr_ts = conv.get("first_reply_created_at") or 0
+    cr_ts = conv.get("created_at") or 0
+    if fr_ts and cr_ts and fr_ts >= cr_ts and (fr_ts - cr_ts) <= 300:
+        with _chat_tracker_lock:
+            _chat_fast_reply_cache[cid_str] = True
+        return True
+
+    return False
+
+
 def _build_delays_report(num_pages=6):
     base_url, token, account_id = get_cw_config()
     headers = _cw_headers()
@@ -1179,6 +1342,22 @@ def _build_delays_report(num_pages=6):
     agents_map = {str(a["id"]): dict(a) for a in all_agents}
     all_mappings = database.get_all_mappings()
     mapping_dict = {str(m["chatwoot_agent_id"]): m["crm_name"] for m in all_mappings if m.get("chatwoot_agent_id")}
+
+    # Load recent assignment timestamps from chats_log for fast-reply (<5m) verification
+    assigned_ts_map = {}
+    try:
+        conn = database.get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT conv_id, assigned_at FROM chats_log WHERE id > (SELECT COALESCE(MAX(id), 0) - 3000 FROM chats_log)")
+        for r in cur.fetchall():
+            if r["conv_id"] and r["assigned_at"]:
+                try:
+                    assigned_ts_map[str(r["conv_id"])] = int(datetime.fromisoformat(r["assigned_at"]).timestamp())
+                except Exception:
+                    pass
+        conn.close()
+    except Exception:
+        pass
     
     def _fetch_page(p):
         url = f"{base_url}/api/v1/accounts/{account_id}/conversations"
@@ -1209,9 +1388,11 @@ def _build_delays_report(num_pages=6):
     
     pending_chats = []
     agent_stats = {}
+    total_exempt_chats = 0
     
     for conv in all_convs:
         cid = conv.get("id")
+        cid_str = str(cid)
         assignee = (conv.get("meta", {}) or {}).get("assignee", {}) or {}
         aid = str(assignee.get("id", ""))
         ag_db = agents_map.get(aid, {})
@@ -1235,29 +1416,70 @@ def _build_delays_report(num_pages=6):
                 "critical_count": 0,
                 "warning_count": 0,
                 "normal_count": 0,
+                "exempt_count": 0,
+                "fast_5m_count": 0,
+                "within_15m_count": 0,
+                "delay_15_30_count": 0,
+                "delay_30_45_count": 0,
+                "delay_over_45_count": 0,
+                "speed_score": 0,
                 "max_delay_minutes": 0,
                 "max_delay_text": "لا يوجد",
                 "in_shift": in_shift,
                 "in_grace_period": in_grace
             }
 
-        
         agent_stats[aid]["open_chats_count"] += 1
         
         waiting_since = conv.get("waiting_since") or 0
+        is_exempt, exempt_reason = (False, "")
         if waiting_since and waiting_since > 0:
+            is_exempt, exempt_reason = _is_chat_delay_exempt(conv)
+
+        if waiting_since and waiting_since > 0 and not is_exempt:
+            # Track active waiting_since so we can measure reply speed when agent responds
+            with _chat_tracker_lock:
+                _chat_wait_tracker[cid_str] = waiting_since
+                _chat_fast_reply_cache.pop(cid_str, None)
+
             delay_sec = max(0, now_ts - waiting_since)
             delay_min = round(delay_sec / 60.0, 1)
             
-            if delay_min >= 15.0:
+            # Score & severity calculation on genuinely waiting chats:
+            # < 15 min: +1 point
+            # 15 - 29.9 min: -1 point
+            # 30 - 44.9 min: -2 points
+            # 45+ min: -3 points
+            if delay_min >= 45.0:
                 severity = "critical"
                 agent_stats[aid]["critical_count"] += 1
+                agent_stats[aid]["delay_over_45_count"] += 1
+                agent_stats[aid]["speed_score"] -= 3
+                chat_points = -3
+            elif delay_min >= 30.0:
+                severity = "critical"
+                agent_stats[aid]["critical_count"] += 1
+                agent_stats[aid]["delay_30_45_count"] += 1
+                agent_stats[aid]["speed_score"] -= 2
+                chat_points = -2
+            elif delay_min >= 15.0:
+                severity = "critical"
+                agent_stats[aid]["critical_count"] += 1
+                agent_stats[aid]["delay_15_30_count"] += 1
+                agent_stats[aid]["speed_score"] -= 1
+                chat_points = -1
             elif delay_min >= 5.0:
                 severity = "warning"
                 agent_stats[aid]["warning_count"] += 1
+                agent_stats[aid]["within_15m_count"] += 1
+                agent_stats[aid]["speed_score"] += 1
+                chat_points = 1
             else:
                 severity = "normal"
                 agent_stats[aid]["normal_count"] += 1
+                agent_stats[aid]["within_15m_count"] += 1
+                agent_stats[aid]["speed_score"] += 1
+                chat_points = 1
                 
             agent_stats[aid]["pending_count"] += 1
             if delay_min > agent_stats[aid]["max_delay_minutes"]:
@@ -1295,6 +1517,7 @@ def _build_delays_report(num_pages=6):
                 "waiting_since_text": wait_text,
                 "delay_minutes": delay_min,
                 "severity": severity,
+                "points_impact": chat_points,
                 "agent_id": aid,
                 "agent_name": ag_name,
                 "crm_name": crm_name,
@@ -1306,23 +1529,41 @@ def _build_delays_report(num_pages=6):
                 "last_message": last_msg[:140] if last_msg else "—",
                 "labels": conv.get("labels", [])
             })
+        else:
+            # Conversation is either answered (waiting_since == 0) OR exempt (private note, 'تمام/شكرا', like/sticker)
+            if is_exempt:
+                agent_stats[aid]["exempt_count"] += 1
+                total_exempt_chats += 1
 
+            is_fast_5m = _check_if_fast_reply_5m(conv, cid_str, assigned_ts_map, now_ts)
+            if is_fast_5m:
+                agent_stats[aid]["fast_5m_count"] += 1
+                agent_stats[aid]["speed_score"] += 2
+            else:
+                agent_stats[aid]["within_15m_count"] += 1
+                agent_stats[aid]["speed_score"] += 1
 
     # Sort pending chats by delay descending (longest delay first)
     pending_chats.sort(key=lambda x: x["delay_minutes"], reverse=True)
     
-    # Sort agents summary by critical count then pending count then max delay
+    # Sort agents summary by speed_score descending (highest score first), then open chats descending
     agents_list = list(agent_stats.values())
-    agents_list.sort(key=lambda a: (a["critical_count"], a["pending_count"], a["max_delay_minutes"]), reverse=True)
+    agents_list.sort(key=lambda a: (a["speed_score"], a["open_chats_count"], -a["critical_count"]), reverse=True)
     
     critical_total = sum(1 for c in pending_chats if c["severity"] == "critical")
     warning_total = sum(1 for c in pending_chats if c["severity"] == "warning")
     normal_total = sum(1 for c in pending_chats if c["severity"] == "normal")
     
     most_delayed = "لا يوجد"
-    if agents_list and agents_list[0]["pending_count"] > 0:
-        top_ag = agents_list[0]
+    delayed_sorted = sorted(agents_list, key=lambda a: (a["critical_count"], a["pending_count"], a["max_delay_minutes"]), reverse=True)
+    if delayed_sorted and delayed_sorted[0]["pending_count"] > 0:
+        top_ag = delayed_sorted[0]
         most_delayed = f"{top_ag['agent_name']} ({top_ag['pending_count']} معلقة)"
+
+    top_scored_agent = "لا يوجد"
+    if agents_list:
+        best_ag = max(agents_list, key=lambda a: a["speed_score"])
+        top_scored_agent = f"{best_ag['agent_name']} ({best_ag['speed_score']} نقطة)"
 
     longest_delay_formatted = "0 دقيقة"
     if pending_chats:
@@ -1339,12 +1580,14 @@ def _build_delays_report(num_pages=6):
         "summary": {
             "total_scanned_chats": len(all_convs),
             "total_pending_chats": len(pending_chats),
+            "total_exempt_chats": total_exempt_chats,
             "critical_count": critical_total,
             "warning_count": warning_total,
             "normal_count": normal_total,
             "longest_delay_minutes": pending_chats[0]["delay_minutes"] if pending_chats else 0,
             "longest_delay_formatted": longest_delay_formatted,
             "most_delayed_agent": most_delayed,
+            "top_scored_agent": top_scored_agent,
             "fetch_duration_seconds": round(dur, 2),
             "timestamp": datetime.now(CAIRO_TZ).strftime("%Y-%m-%d %I:%M:%S %p")
         },

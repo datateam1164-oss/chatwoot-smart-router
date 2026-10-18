@@ -15,6 +15,7 @@ export default function ReportsPage() {
   const [teamFilter, setTeamFilter] = useState('all'); // 'all', 'Sales', 'Data'
   const [severityFilter, setSeverityFilter] = useState('all'); // 'all', 'critical', 'warning', 'normal'
   const [activeTab, setActiveTab] = useState('chats'); // 'chats' or 'agents'
+  const [agentSortBy, setAgentSortBy] = useState('score_desc'); // 'score_desc' or 'delay_desc'
   const [scanPages, setScanPages] = useState(6);
   const [autoRefresh, setAutoRefresh] = useState(false);
 
@@ -93,24 +94,43 @@ export default function ReportsPage() {
     const basePending = salesOnly ? pending.filter(c => c.is_mapped_sales) : pending;
     const baseAgents = salesOnly ? agents.filter(a => a.is_mapped_sales) : agents;
 
-    // Filter agents with pending chats
-    const delayedAgents = baseAgents.filter(a => (a.pending_count || 0) > 0).slice(0, 10);
+    // Sort by score descending for leaderboard
+    const topScoredAgents = [...baseAgents].sort((a, b) => (b.speed_score || 0) - (a.speed_score || 0));
+    // Filter agents with pending chats sorted by delay
+    const delayedAgents = [...baseAgents]
+      .filter(a => (a.pending_count || 0) > 0)
+      .sort((a, b) => (b.critical_count - a.critical_count) || (b.pending_count - a.pending_count) || (b.max_delay_minutes - a.max_delay_minutes))
+      .slice(0, 10);
     // Filter critical chats
     const criticalChats = basePending.filter(c => c.severity === 'critical').slice(0, 10);
 
-    let text = `📊 *تقرير تأخيرات الرد ومراقبة الأداء${salesOnly ? ' (سيلز الـ CRM فقط)' : ''}*\n`;
+    let text = `📊 *تقرير تأخيرات الرد وسكور السيلز${salesOnly ? ' (سيلز الـ CRM فقط)' : ''}*\n`;
     text += `🕒 *الوقت:* ${s.timestamp || ''}\n`;
     text += `🔍 *نطاق الفحص:* فحص ${s.total_scanned_chats || 0} محادثة مفتوحة\n`;
+    if (s.total_exempt_chats > 0) {
+      text += `🛡️ *شاتات معفاة تلقائياً (برايفت نوت/تمام/لايك):* ${s.total_exempt_chats} محادثة\n`;
+    }
     if (salesOnly) {
       text += `🎯 *الفلترة:* موظفو السيلز المطابقين في الـ CRM فقط\n`;
     }
     text += `━━━━━━━━━━━━━━━━━━━━\n`;
     text += `⚡ *الملخص العام:*\n`;
-    text += `💬 إجمالي الشاتات المعلقة: *${basePending.length}* محادثة\n`;
+    text += `💬 إجمالي الشاتات المعلقة الفعلي: *${basePending.length}* محادثة\n`;
     text += `🚨 تأخير حرج (15+ دقيقة): *${basePending.filter(c => c.severity === 'critical').length}*\n`;
     text += `⏳ تحذير تأخير (5-14 دقيقة): *${basePending.filter(c => c.severity === 'warning').length}*\n`;
-    text += `🟢 تأخير طبيعي (<5 دقيقة): *${basePending.filter(c => c.severity === 'normal').length}*\n`;
+    text += `🟢 انتظار طبيعي (<5 دقيقة): *${basePending.filter(c => c.severity === 'normal').length}*\n`;
     text += `🏃 أطول مدة انتظار: *${s.longest_delay_formatted || '0 د'}* (${s.most_delayed_agent || 'لا يوجد'})\n`;
+
+    if (topScoredAgents.length > 0) {
+      text += `━━━━━━━━━━━━━━━━━━━━\n`;
+      text += `🏆 *سكور السيلز (حسب سرعة الرد وعدد الشاتات المفتوحة):*\n`;
+      topScoredAgents.forEach((a, i) => {
+        const sc = a.speed_score || 0;
+        const scSign = sc > 0 ? `+${sc}` : `${sc}`;
+        const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : '🔹';
+        text += `${medal} *${a.agent_name}* | السكور: *${scSign} نقطة* (مفتوح: ${a.open_chats_count} | حرج: ${a.critical_count || 0})\n`;
+      });
+    }
 
     if (delayedAgents.length > 0) {
       text += `━━━━━━━━━━━━━━━━━━━━\n`;
@@ -127,7 +147,8 @@ export default function ReportsPage() {
       criticalChats.forEach(c => {
         const phone = c.customer_phone ? ` (${c.customer_phone})` : '';
         const lbls = (c.labels && c.labels.length > 0) ? ` [${c.labels.join(', ')}]` : '';
-        text += `• #${c.conv_id}${lbls} | ${c.agent_name} | عميل: ${c.customer_name}${phone} | انتظار: ${c.waiting_since_text}\n`;
+        const pts = c.points_impact ? ` (${c.points_impact} نقطة)` : '';
+        text += `• #${c.conv_id}${lbls} | ${c.agent_name} | عميل: ${c.customer_name}${phone} | انتظار: ${c.waiting_since_text}${pts}\n`;
       });
     }
 
@@ -188,7 +209,7 @@ export default function ReportsPage() {
   // Filtered Agents Summary
   const filteredAgents = useMemo(() => {
     if (!report || !report.agents_summary) return [];
-    return report.agents_summary.filter(a => {
+    const list = report.agents_summary.filter(a => {
       // Sales only filter
       if (salesOnly && !a.is_mapped_sales) return false;
       if (teamFilter !== 'all' && a.team !== teamFilter) return false;
@@ -200,17 +221,24 @@ export default function ReportsPage() {
       }
       return true;
     });
-  }, [report, salesOnly, teamFilter, search]);
+    if (agentSortBy === 'score_desc') {
+      return [...list].sort((a, b) => ((b.speed_score || 0) - (a.speed_score || 0)) || ((b.open_chats_count || 0) - (a.open_chats_count || 0)));
+    } else {
+      return [...list].sort((a, b) => ((b.critical_count || 0) - (a.critical_count || 0)) || ((b.pending_count || 0) - (a.pending_count || 0)) || ((b.max_delay_minutes || 0) - (a.max_delay_minutes || 0)));
+    }
+  }, [report, salesOnly, teamFilter, search, agentSortBy]);
 
 
   const summary = report?.summary || {
     total_scanned_chats: 0,
     total_pending_chats: 0,
+    total_exempt_chats: 0,
     critical_count: 0,
     warning_count: 0,
     normal_count: 0,
     longest_delay_formatted: '0 دقيقة',
     most_delayed_agent: 'لا يوجد',
+    top_scored_agent: 'لا يوجد',
     timestamp: '—',
     fetch_duration_seconds: 0
   };
@@ -756,12 +784,27 @@ export default function ReportsPage() {
             borderBottom: `1px solid ${C.border}`,
             display: 'flex',
             alignItems: 'center',
-            justifyContent: 'space-between'
+            justifyContent: 'space-between',
+            flexWrap: 'wrap',
+            gap: 10
           }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
               <span style={{ fontSize: 18 }}>💬</span>
-              <strong style={{ fontSize: 16, color: C.textBright }}>قائمة الشاتات المعلقة بدون رد</strong>
+              <strong style={{ fontSize: 16, color: C.textBright }}>قائمة الشاتات المعلقة بدون رد (الفعلي)</strong>
               <span style={{ fontSize: 12, color: C.textDim }}>({filteredChats.length} محادثة مطابقة)</span>
+              {summary.total_exempt_chats > 0 && (
+                <span style={{
+                  fontSize: 11,
+                  padding: '3px 10px',
+                  borderRadius: 8,
+                  background: 'rgba(16,185,129,0.12)',
+                  color: C.greenLight,
+                  border: '1px solid rgba(16,185,129,0.3)',
+                  fontWeight: 700
+                }} title="تم استبعاد المحادثات التي كتب فيها الموظف Private Note أو أرسل فيها العميل تمام/شكراً/لايك/استيكر">
+                  🛡️ تم إعفاء واستبعاد {summary.total_exempt_chats} شات (برايفت نوت / تمام وشكراً / لايك)
+                </span>
+              )}
             </div>
             {filteredChats.length > 0 && (
               <span style={{ fontSize: 11, color: C.textDim }}>
@@ -780,7 +823,7 @@ export default function ReportsPage() {
                   <th style={{ padding: '12px 16px', fontWeight: 700, minWidth: 200 }}>آخر رسالة من العميل</th>
                   <th style={{ padding: '12px 16px', fontWeight: 700 }}>الموظف المسند إليه</th>
                   <th style={{ padding: '12px 16px', fontWeight: 700 }}>مدة الانتظار</th>
-                  <th style={{ padding: '12px 16px', fontWeight: 700, textAlign: 'center', width: 130 }}>درجة التأخير</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 700, textAlign: 'center', width: 155 }}>درجة التأخير والسكور</th>
                   <th style={{ padding: '12px 16px', fontWeight: 700, textAlign: 'center', width: 140 }}>إجراء المشرف</th>
                 </tr>
               </thead>
@@ -790,13 +833,14 @@ export default function ReportsPage() {
                     <td colSpan={8} style={{ textAlign: 'center', padding: '50px 20px', color: C.textDim }}>
                       <div style={{ fontSize: 32, marginBottom: 10 }}>🎉</div>
                       <div style={{ fontSize: 15, fontWeight: 700, color: C.textBright }}>لا توجد محادثات معلقة مطابقة للفلاتر المحددة</div>
-                      <div style={{ fontSize: 12, marginTop: 4 }}>جميع الشاتات في النطاق المفحوص تم الرد عليها أو لا تنتظر رداً</div>
+                      <div style={{ fontSize: 12, marginTop: 4 }}>جميع الشاتات في النطاق المفحوص تم الرد عليها أو معفاة (برايفت نوت / إغلاق طبيعي)</div>
                     </td>
                   </tr>
                 ) : (
                   filteredChats.map((chat) => {
                     const isCritical = chat.severity === 'critical';
                     const isWarning = chat.severity === 'warning';
+                    const pts = chat.points_impact !== undefined ? chat.points_impact : (isCritical ? -1 : 1);
 
                     return (
                       <tr
@@ -927,7 +971,7 @@ export default function ReportsPage() {
                           </div>
                         </td>
 
-                        {/* Severity Badge */}
+                        {/* Severity Badge & Points Impact */}
                         <td style={{ padding: '12px 16px', textAlign: 'center', whiteSpace: 'nowrap' }}>
                           {isCritical ? (
                             <span style={{
@@ -940,7 +984,7 @@ export default function ReportsPage() {
                               fontSize: 11,
                               fontWeight: 700
                             }}>
-                              🔴 تأخير حرج
+                              🔴 تأخير حرج ({pts} نقطة)
                             </span>
                           ) : isWarning ? (
                             <span style={{
@@ -953,7 +997,7 @@ export default function ReportsPage() {
                               fontSize: 11,
                               fontWeight: 700
                             }}>
-                              🟡 تحذير
+                              🟡 أقل من 15 د (+1 نقطة)
                             </span>
                           ) : (
                             <span style={{
@@ -966,7 +1010,7 @@ export default function ReportsPage() {
                               fontSize: 11,
                               fontWeight: 700
                             }}>
-                              🟢 طبيعي
+                              🟢 طبيعي (+1 نقطة)
                             </span>
                           )}
                         </td>
@@ -999,23 +1043,78 @@ export default function ReportsPage() {
           </div>
         </div>
       ) : (
-        /* ════════════ TABLE 2: AGENTS PERFORMANCE SUMMARY ════════════ */
+        /* ════════════ TABLE 2: AGENTS PERFORMANCE & SCORE SUMMARY ════════════ */
         <div className="card" style={{ overflow: 'hidden' }}>
           <div style={{
             padding: '16px 20px',
             borderBottom: `1px solid ${C.border}`,
             display: 'flex',
             alignItems: 'center',
-            justifyContent: 'space-between'
+            justifyContent: 'space-between',
+            flexWrap: 'wrap',
+            gap: 12
           }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-              <span style={{ fontSize: 18 }}>👥</span>
-              <strong style={{ fontSize: 16, color: C.textBright }}>ملخص سرعة الاستجابة وأداء الموظفين</strong>
+              <span style={{ fontSize: 18 }}>🏆</span>
+              <strong style={{ fontSize: 16, color: C.textBright }}>سكور السيلز وملخص سرعة الاستجابة</strong>
               <span style={{ fontSize: 12, color: C.textDim }}>({filteredAgents.length} موظف نشط في العينة)</span>
             </div>
-            <span style={{ fontSize: 11, color: C.textDim }}>
-              💡 يوضح الموظفين الأكثر تأخراً في الرد على العملاء
-            </span>
+
+            {/* Sort Toggle for Agents Table */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, background: 'rgba(255,255,255,0.03)', padding: '3px 8px', borderRadius: 10, border: `1px solid ${C.borderLight}` }}>
+              <span style={{ fontSize: 11, color: C.textDim, marginLeft: 4 }}>الترتيب:</span>
+              <button
+                onClick={() => setAgentSortBy('score_desc')}
+                style={{
+                  padding: '4px 10px',
+                  borderRadius: 7,
+                  fontSize: 11,
+                  fontWeight: 700,
+                  cursor: 'pointer',
+                  background: agentSortBy === 'score_desc' ? 'rgba(16,185,129,0.2)' : 'transparent',
+                  color: agentSortBy === 'score_desc' ? C.greenLight : C.textDim,
+                  border: agentSortBy === 'score_desc' ? '1px solid rgba(16,185,129,0.5)' : '1px solid transparent'
+                }}
+              >
+                🏆 الأعلى سكور أولاً
+              </button>
+              <button
+                onClick={() => setAgentSortBy('delay_desc')}
+                style={{
+                  padding: '4px 10px',
+                  borderRadius: 7,
+                  fontSize: 11,
+                  fontWeight: 700,
+                  cursor: 'pointer',
+                  background: agentSortBy === 'delay_desc' ? 'rgba(239,68,68,0.2)' : 'transparent',
+                  color: agentSortBy === 'delay_desc' ? C.redLight : C.textDim,
+                  border: agentSortBy === 'delay_desc' ? `1px solid ${C.redBorder}` : '1px solid transparent'
+                }}
+              >
+                🚨 الأكثر تأخيراً أولاً
+              </button>
+            </div>
+          </div>
+
+          {/* Score Formula Legend Bar */}
+          <div style={{
+            padding: '10px 20px',
+            background: 'rgba(56,189,248,0.04)',
+            borderBottom: `1px solid ${C.borderLight}`,
+            display: 'flex',
+            alignItems: 'center',
+            flexWrap: 'wrap',
+            gap: 14,
+            fontSize: 11,
+            color: C.textMuted
+          }}>
+            <strong style={{ color: C.textBright }}>📌 قاعدة حساب السكور (لكل شات مفتوح):</strong>
+            <span style={{ color: '#38bdf8', fontWeight: 700 }}>⚡ رد خلال أول 5 د = +2 نقطة</span>
+            <span style={{ color: C.greenLight, fontWeight: 700 }}>🟢 حتى 15 د / مردود / معفي = +1 نقطة</span>
+            <span style={{ color: C.yellowLight, fontWeight: 700 }}>🟡 تأخير 15 - 30 د = -1 نقطة</span>
+            <span style={{ color: '#fb923c', fontWeight: 700 }}>🟠 تأخير 30 - 45 د = -2 نقطتين</span>
+            <span style={{ color: C.redLight, fontWeight: 700 }}>🔴 تأخير +45 د = -3 نقاط</span>
+            <span style={{ color: C.textDim, marginRight: 'auto' }}>🛡️ البرايفت نوت و"تمام/شكراً/لايك/استيكر" لا تُحسب تأخيراً</span>
           </div>
 
           <div style={{ overflowX: 'auto' }}>
@@ -1024,9 +1123,10 @@ export default function ReportsPage() {
                 <tr style={{ background: 'rgba(255,255,255,0.02)', borderBottom: `1px solid ${C.border}`, color: C.textDim }}>
                   <th style={{ padding: '12px 16px', fontWeight: 700 }}>الموظف</th>
                   <th style={{ padding: '12px 16px', fontWeight: 700 }}>التيم</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 700, textAlign: 'center' }}>🏆 السكور وتفاصيل النقاط</th>
                   <th style={{ padding: '12px 16px', fontWeight: 700, textAlign: 'center' }}>حالة الشيفت</th>
                   <th style={{ padding: '12px 16px', fontWeight: 700, textAlign: 'center' }}>الشاتات المفتوحة</th>
-                  <th style={{ padding: '12px 16px', fontWeight: 700, textAlign: 'center' }}>المعلقة بدون رد</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 700, textAlign: 'center' }}>المعلقة الفعلي</th>
                   <th style={{ padding: '12px 16px', fontWeight: 700, textAlign: 'center' }}>تأخير حرج (15+ د)</th>
                   <th style={{ padding: '12px 16px', fontWeight: 700, textAlign: 'center' }}>أقصى تأخير مسجل</th>
                   <th style={{ padding: '12px 16px', fontWeight: 700, textAlign: 'center' }}>تقييم السرعة</th>
@@ -1036,14 +1136,18 @@ export default function ReportsPage() {
               <tbody>
                 {filteredAgents.length === 0 ? (
                   <tr>
-                    <td colSpan={9} style={{ textAlign: 'center', padding: '50px 20px', color: C.textDim }}>
+                    <td colSpan={10} style={{ textAlign: 'center', padding: '50px 20px', color: C.textDim }}>
                       لا توجد بيانات موظفين مطابقة للبحث
                     </td>
                   </tr>
                 ) : (
-                  filteredAgents.map((ag) => {
+                  filteredAgents.map((ag, idx) => {
                     const hasCritical = ag.critical_count > 0;
                     const hasWarning = ag.warning_count > 0;
+                    const score = ag.speed_score || 0;
+                    const scorePositive = score > 0;
+                    const scoreNegative = score < 0;
+                    const medal = agentSortBy === 'score_desc' ? (idx === 0 ? '🥇 ' : idx === 1 ? '🥈 ' : idx === 2 ? '🥉 ' : '') : '';
 
                     return (
                       <tr
@@ -1056,7 +1160,9 @@ export default function ReportsPage() {
                       >
                         {/* Agent Name */}
                         <td style={{ padding: '12px 16px' }}>
-                          <div style={{ fontWeight: 700, color: C.textBright }}>{ag.agent_name}</div>
+                          <div style={{ fontWeight: 700, color: C.textBright }}>
+                            {medal}{ag.agent_name}
+                          </div>
                           {ag.crm_name ? (
                             <div style={{ fontSize: 11, color: C.greenLight, marginTop: 2, fontWeight: 600 }}>
                               CRM: {ag.crm_name}
@@ -1081,6 +1187,54 @@ export default function ReportsPage() {
                           }}>
                             {ag.is_mapped_sales ? 'Sales' : 'CS'}
                           </span>
+                        </td>
+
+                        {/* Speed Score & Breakdown */}
+                        <td style={{ padding: '12px 16px', textAlign: 'center', minWidth: 200 }}>
+                          <div style={{
+                            display: 'inline-block',
+                            padding: '4px 12px',
+                            borderRadius: 8,
+                            fontWeight: 800,
+                            fontSize: 14,
+                            background: scorePositive ? 'rgba(16,185,129,0.16)' : (scoreNegative ? C.redBg : 'rgba(255,255,255,0.06)'),
+                            color: scorePositive ? C.greenLight : (scoreNegative ? C.redLight : C.textBright),
+                            border: `1px solid ${scorePositive ? 'rgba(16,185,129,0.4)' : (scoreNegative ? C.redBorder : C.border)}`
+                          }}>
+                            {score > 0 ? `+${score}` : score} نقطة
+                          </div>
+                          <div style={{ display: 'flex', justifyContent: 'center', flexWrap: 'wrap', gap: 4, marginTop: 5, fontSize: 10 }}>
+                            {(ag.fast_5m_count || 0) > 0 && (
+                              <span style={{ padding: '1px 5px', borderRadius: 4, background: 'rgba(56,189,248,0.15)', color: C.accent, fontWeight: 700 }} title="شاتات تم الرد عليها خلال أول 5 دقائق (+2 نقطة لكل شات)">
+                                ⚡5د: {ag.fast_5m_count} (+{ag.fast_5m_count * 2})
+                              </span>
+                            )}
+                            {(ag.within_15m_count || 0) > 0 && (
+                              <span style={{ padding: '1px 5px', borderRadius: 4, background: 'rgba(16,185,129,0.12)', color: C.greenLight, fontWeight: 600 }} title="شاتات ملتزمة أقل من 15 دقيقة أو مردود عليها (+1 نقطة لكل شات)">
+                                🟢15د: {ag.within_15m_count} (+{ag.within_15m_count})
+                              </span>
+                            )}
+                            {(ag.exempt_count || 0) > 0 && (
+                              <span style={{ padding: '1px 5px', borderRadius: 4, background: 'rgba(167,139,250,0.15)', color: C.purple, fontWeight: 600 }} title="شاتات معفاة (برايفت نوت / تمام وشكراً / لايك)">
+                                🛡️معفي: {ag.exempt_count}
+                              </span>
+                            )}
+                            {(ag.delay_15_30_count || 0) > 0 && (
+                              <span style={{ padding: '1px 5px', borderRadius: 4, background: C.yellowBg, color: C.yellowLight, fontWeight: 700 }} title="تأخير 15 إلى 30 دقيقة (-1 نقطة لكل شات)">
+                                🟡15-30د: {ag.delay_15_30_count} (-{ag.delay_15_30_count})
+                              </span>
+                            )}
+                            {(ag.delay_30_45_count || 0) > 0 && (
+                              <span style={{ padding: '1px 5px', borderRadius: 4, background: 'rgba(251,146,60,0.15)', color: '#fb923c', fontWeight: 700 }} title="تأخير 30 إلى 45 دقيقة (-2 نقطة لكل شات)">
+                                🟠30-45د: {ag.delay_30_45_count} (-{ag.delay_30_45_count * 2})
+                              </span>
+                            )}
+                            {(ag.delay_over_45_count || 0) > 0 && (
+                              <span style={{ padding: '1px 5px', borderRadius: 4, background: C.redBg, color: C.redLight, fontWeight: 700 }} title="تأخير أكثر من 45 دقيقة (-3 نقاط لكل شات)">
+                                🔴+45د: {ag.delay_over_45_count} (-{ag.delay_over_45_count * 3})
+                              </span>
+                            )}
+                          </div>
                         </td>
 
                         {/* Shift Status */}

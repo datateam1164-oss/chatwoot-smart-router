@@ -995,27 +995,22 @@ export default function ReportsPage() {
             🎯 مرجع السعة عند التحويل: <strong style={{ color: C.accent }}>سقف الـ 30 دقيقة للموظف</strong> (سواء 20 أو 10 أو 5) ثم <strong style={{ color: C.greenLight }}>سقف اليوم الكامل</strong>
           </div>
 
-          {/* Match Agent Label Checkbox */}
-          <label style={{
+          {/* Mandatory Label Classification Badge */}
+          <div style={{
             display: 'inline-flex',
             alignItems: 'center',
             gap: 6,
-            fontSize: 12,
-            color: C.textBright,
-            cursor: 'pointer',
-            background: 'rgba(255,255,255,0.04)',
-            padding: '5px 10px',
+            fontSize: 11,
+            color: C.greenLight,
+            background: 'rgba(16,185,129,0.1)',
+            padding: '5px 12px',
             borderRadius: 8,
-            border: `1px solid ${C.borderLight}`
-          }}>
-            <input
-              type="checkbox"
-              checked={Boolean(reassignConfig.match_agent_label)}
-              onChange={(e) => setReassignConfig(prev => ({ ...prev, match_agent_label: e.target.checked }))}
-              style={{ accentColor: C.accent, cursor: 'pointer' }}
-            />
-            <span>مطابقة ليبل/تخصص الموظف</span>
-          </label>
+            border: '1px solid rgba(16,185,129,0.35)',
+            fontWeight: 700
+          }} title="لا يتم تحويل أي شات مسحوب إلا لموظف يحمل نفس تصنيف الليبل في إعداداته">
+            <span>🔒</span>
+            <span>شرط إلزامي: التحويل لنفس تصنيف الليبولات فقط</span>
+          </div>
         </div>
 
         {/* Collapsible Recent Smart Reassign History */}

@@ -1984,10 +1984,13 @@ def _get_smart_reassign_config():
     }
 
 
-def _agent_matches_chat_label(ag, matched_label):
-    """Checks if an agent is allowed to receive a given label based on their assigned_labels."""
-    if not matched_label:
-        return True
+def _agent_matches_chat_label(ag, matched_label, all_chat_labels=None):
+    """
+    Strictly checks if an agent belongs to the same label classification (`assigned_labels`)
+    as the pulled chat's Sales label(s).
+    """
+    if not matched_label and not all_chat_labels:
+        return False
     assigned = ag.get("assigned_labels")
     if assigned and isinstance(assigned, str):
         try:
@@ -1997,20 +2000,36 @@ def _agent_matches_chat_label(ag, matched_label):
     elif not assigned:
         assigned = []
 
-    matched_clean = str(matched_label).strip().lower()
+    if not assigned:
+        # Strict: Agent must have explicit assigned_labels configured to receive pulled chats
+        return False
+
+    assigned_lower = [str(l).strip().lower() for l in assigned if str(l).strip()]
+    if not assigned_lower:
+        return False
+
+    matched_clean = str(matched_label or "").strip().lower()
     is_unlabeled_chat = ("بدون ليبل" in matched_clean or "unlabeled" in matched_clean or "no_label" in matched_clean)
 
-    if len(assigned) > 0:
-        assigned_lower = [str(l).strip().lower() for l in assigned]
-        if is_unlabeled_chat:
-            return any("بدون ليبل" in x or "unlabeled" in x or "بدون تصنيف" in x or "no_label" in x for x in assigned_lower)
-        for x in assigned_lower:
-            if x == matched_clean or matched_clean in x or x in matched_clean:
-                return True
-        return False
-    else:
-        # Agent has no specific label restrictions (receives any labeled chat, but unlabeled requires explicit selection)
-        return not is_unlabeled_chat
+    if is_unlabeled_chat:
+        return any("بدون ليبل" in x or "unlabeled" in x or "بدون تصنيف" in x or "no_label" in x for x in assigned_lower)
+
+    # Check primary matched Sales label
+    for x in assigned_lower:
+        if x == matched_clean or matched_clean in x or x in matched_clean:
+            return True
+
+    # If the chat has multiple Sales labels, check if any of its Sales labels match the agent's classification
+    if all_chat_labels:
+        for cl in all_chat_labels:
+            cl_clean = str(cl or "").strip().lower()
+            if not cl_clean:
+                continue
+            for x in assigned_lower:
+                if x == cl_clean or cl_clean in x or x in cl_clean:
+                    return True
+
+    return False
 
 
 def _chat_matches_pullable_labels(chat_labels, pullable_labels):
@@ -2088,8 +2107,8 @@ def _execute_smart_reassign(target_conv_id=None, override_config=None):
     """
     Pulls delayed Sales conversations (> min_delay_minutes, matching selected pullable Sales labels)
     after a live pre-pull verification check, and routes each to the #1 highest-scored in-shift agent
-    whose 30-minute rolling window (current_window_chats < chat_limit) and daily limit (today_count < daily_limit)
-    have available capacity.
+    WHO HAS THE SAME LABEL CLASSIFICATION (`assigned_labels`) and whose 30-minute rolling window
+    (current_window_chats < chat_limit) and daily limit (today_count < daily_limit) have available capacity.
     """
     if not _smart_reassign_lock.acquire(blocking=False):
         return {"success": False, "error": "عملية سحب وتوزيع أخرى قيد التنفيذ حالياً، يرجى الانتظار ثواني."}
@@ -2106,6 +2125,8 @@ def _execute_smart_reassign(target_conv_id=None, override_config=None):
                     pass
             if "match_agent_label" in override_config:
                 cfg["match_agent_label"] = bool(override_config["match_agent_label"])
+        # Always enforce same label classification as a mandatory rule
+        cfg["match_agent_label"] = True
 
         # Always run a fresh or recently cached report scan
         now = time.time()
@@ -2124,6 +2145,7 @@ def _execute_smart_reassign(target_conv_id=None, override_config=None):
 
         pending_chats = report_data.get("pending_chats", [])
         agents_summary_map = {str(a["agent_id"]): dict(a) for a in report_data.get("agents_summary", [])}
+        configured_sales_labels = [str(l).strip().lower() for l in (report_data.get("configured_sales_labels") or []) if str(l).strip()]
 
         # Filter target chats to reassign
         chats_to_reassign = []
@@ -2131,8 +2153,18 @@ def _execute_smart_reassign(target_conv_id=None, override_config=None):
             t_str = str(target_conv_id)
             for ch in pending_chats:
                 if str(ch.get("conv_id")) == t_str:
-                    c_lbls = ch.get("labels") or []
-                    m_lbl = c_lbls[0] if c_lbls else "بدون ليبل (Unlabeled)"
+                    c_lbls = [str(l).strip() for l in (ch.get("labels") or []) if str(l).strip()]
+                    m_lbl = ""
+                    # Pick the primary Sales label according to configured priority order
+                    for sl in configured_sales_labels:
+                        for cl in c_lbls:
+                            if cl.lower() == sl:
+                                m_lbl = cl
+                                break
+                        if m_lbl:
+                            break
+                    if not m_lbl:
+                        m_lbl = c_lbls[0] if c_lbls else "بدون ليبل (Unlabeled)"
                     chats_to_reassign.append((ch, m_lbl))
                     break
             if not chats_to_reassign:
@@ -2218,6 +2250,10 @@ def _execute_smart_reassign(target_conv_id=None, override_config=None):
             old_aid = str(ch.get("agent_id") or "")
             old_aname = ch.get("agent_name") or "غير محدد"
             delay_min = ch.get("delay_minutes") or 0
+            chat_sales_labels = [
+                str(l).strip() for l in (ch.get("labels") or [])
+                if str(l).strip().lower() in configured_sales_labels
+            ]
 
             # 1. LIVE PRE-PULL VERIFICATION: Confirm the agent hasn't replied or written a Private Note right before pulling
             still_delayed, skip_reason = _verify_chat_still_delayed_live(
@@ -2232,36 +2268,29 @@ def _execute_smart_reassign(target_conv_id=None, override_config=None):
                 logger.info(f"⏭️ Skipped pulling conv #{cid}: {skip_reason}")
                 continue
 
-            # 2. Filter eligible receivers strictly by:
+            # 2. Filter eligible receivers STRICTLY by:
             #    - Not the same agent (c_id != old_aid)
             #    - 30-Minute Rolling Window: current_window_chats < window_limit (whether 20, 10, or 5)
             #    - Full Day Limit: live_today_count < daily_limit
-            #    - Label match
-            def _filter_receivers(enforce_label=True):
-                pool = []
-                for cand in candidate_agents:
-                    c_id = str(cand["id"])
-                    if c_id == old_aid:
-                        continue
-                    if cand["current_window_chats"] >= cand["window_limit"]:
-                        continue
-                    if cand["live_today_count"] >= cand["daily_limit"]:
-                        continue
-                    if enforce_label and cfg["match_agent_label"] and not _agent_matches_chat_label(cand, matched_label):
-                        continue
-                    pool.append(cand)
-                return pool
-
-            eligible_pool = _filter_receivers(enforce_label=True)
-            if not eligible_pool and cfg["match_agent_label"]:
-                # Fallback if all label-matched agents reached their 30m limit: allow any in-shift Sales agent with 30m capacity
-                eligible_pool = _filter_receivers(enforce_label=False)
+            #    - MANDATORY Same Label Classification: _agent_matches_chat_label(cand, matched_label, chat_sales_labels)
+            eligible_pool = []
+            for cand in candidate_agents:
+                c_id = str(cand["id"])
+                if c_id == old_aid:
+                    continue
+                if cand["current_window_chats"] >= cand["window_limit"]:
+                    continue
+                if cand["live_today_count"] >= cand["daily_limit"]:
+                    continue
+                if not _agent_matches_chat_label(cand, matched_label, chat_sales_labels):
+                    continue
+                eligible_pool.append(cand)
 
             if not eligible_pool:
                 skipped.append({
                     "conv_id": cid,
                     "label": matched_label,
-                    "reason": "جميع الموظفين المتاحين في الشيفت استنفدوا سقف الـ 30 دقيقة أو سقف اليوم"
+                    "reason": f"لا يوجد موظف متاح حالياً من نفس تصنيف الليبل ({matched_label}) لم يستنفد سقف الـ 30 دقيقة أو سقف اليوم"
                 })
                 continue
 

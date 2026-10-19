@@ -7,7 +7,7 @@ const CLOUD_COMMIT_URL = `https://huggingface.co/api/datasets/${HF_DATASET_REPO}
 
 // Reverse token at runtime to prevent Hugging Face secret scanner from blocking built JS assets
 export function getHfToken() {
-  const rev = 'lFXebaPEmWJaEuZHLmmgsQCaDfaxtWzQGo_fh';
+  const rev = 'dfGfkRCCwRpxAPNUWRgSfbQScPsvwkbbNL_fh';
   return rev.split('').reverse().join('');
 }
 

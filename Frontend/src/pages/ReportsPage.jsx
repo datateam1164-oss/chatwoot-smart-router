@@ -858,7 +858,7 @@ export default function ReportsPage() {
 
         {/* Row 2: Selectable Sales Pullable Labels (اختيار ليبلات السيلز المسموح بسحبها فقط) */}
         <div style={{
-          background: 'rgba(15,23,42,0.55)',
+          background: C.bgLight,
           padding: '12px 14px',
           borderRadius: 12,
           border: `1px solid ${C.borderLight}`
@@ -925,7 +925,7 @@ export default function ReportsPage() {
                     cursor: 'pointer',
                     background: isSelected
                       ? 'rgba(16,185,129,0.2)'
-                      : 'rgba(255,255,255,0.04)',
+                      : C.bgLighter,
                     color: isSelected ? C.greenLight : C.textMuted,
                     border: isSelected
                       ? '1px solid rgba(16,185,129,0.55)'
@@ -972,7 +972,7 @@ export default function ReportsPage() {
                   fontSize: 11,
                   fontWeight: 700,
                   cursor: 'pointer',
-                  background: Number(reassignConfig.min_delay_minutes) === mins ? 'rgba(239,68,68,0.2)' : 'rgba(255,255,255,0.04)',
+                  background: Number(reassignConfig.min_delay_minutes) === mins ? 'rgba(239,68,68,0.2)' : C.bgLighter,
                   color: Number(reassignConfig.min_delay_minutes) === mins ? C.redLight : C.textDim,
                   border: Number(reassignConfig.min_delay_minutes) === mins ? `1px solid ${C.redBorder}` : '1px solid transparent'
                 }}
@@ -1016,7 +1016,7 @@ export default function ReportsPage() {
         {/* Collapsible Recent Smart Reassign History */}
         {showReassignHistory && reassignHistory.length > 0 && (
           <div style={{
-            background: 'rgba(15,23,42,0.75)',
+            background: C.bgLight,
             borderRadius: 12,
             padding: '12px 14px',
             border: '1px solid rgba(168,85,247,0.35)',
@@ -1039,7 +1039,7 @@ export default function ReportsPage() {
                     fontSize: 12,
                     padding: '6px 10px',
                     borderRadius: 8,
-                    background: 'rgba(255,255,255,0.03)',
+                    background: C.bgLighter,
                     border: `1px solid ${C.borderLight}`
                   }}
                 >
@@ -1093,8 +1093,8 @@ export default function ReportsPage() {
                 fontWeight: 700,
                 fontSize: 14,
                 cursor: 'pointer',
-                background: activeTab === 'chats' ? C.accent : 'rgba(255,255,255,0.05)',
-                color: activeTab === 'chats' ? '#0f172a' : C.textMuted,
+                background: activeTab === 'chats' ? C.accent : C.bgLighter,
+                color: activeTab === 'chats' ? '#FCF9F6' : C.textMuted,
                 transition: 'all 0.2s ease',
                 display: 'flex',
                 alignItems: 'center',
@@ -1122,8 +1122,8 @@ export default function ReportsPage() {
                 fontWeight: 700,
                 fontSize: 14,
                 cursor: 'pointer',
-                background: activeTab === 'agents' ? C.accent : 'rgba(255,255,255,0.05)',
-                color: activeTab === 'agents' ? '#0f172a' : C.textMuted,
+                background: activeTab === 'agents' ? C.accent : C.bgLighter,
+                color: activeTab === 'agents' ? '#FCF9F6' : C.textMuted,
                 transition: 'all 0.2s ease',
                 display: 'flex',
                 alignItems: 'center',

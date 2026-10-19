@@ -6,30 +6,30 @@ export const C = {
   accent:       'var(--primary)',
   accentDark:   'var(--primary-hover)',
   accentGlow:   'var(--primary-bg)',
-  accentBorder: 'var(--border-subtle)',
+  accentBorder: 'var(--primary-border)',
   text:         'var(--text-main)',
   textBright:   'var(--text-main)',
   textMuted:    'var(--text-muted)',
   textDim:      'var(--text-dim)',
   border:       'var(--border-subtle)',
   borderLight:  'var(--border-subtle)',
-  green:        '#10b981',
-  greenLight:   '#34d399',
+  green:        'var(--badge-ready-solid, #10b981)',
+  greenLight:   'var(--badge-ready-text)',
   greenBg:      'var(--badge-ready-bg)',
   greenBorder:  'var(--badge-ready-border)',
-  red:          '#ef4444',
-  redLight:     '#f87171',
+  red:          'var(--badge-capped-solid, #ef4444)',
+  redLight:     'var(--badge-capped-text)',
   redBg:        'var(--badge-capped-bg)',
   redBorder:    'var(--badge-capped-border)',
   redText:      'var(--badge-capped-text)',
-  yellow:       '#f59e0b',
-  yellowLight:  '#fbbf24',
+  yellow:       'var(--badge-paused-solid, #f59e0b)',
+  yellowLight:  'var(--badge-paused-text)',
   yellowBg:     'var(--badge-paused-bg)',
-  purple:       '#a78bfa',
-  purpleBg:     'rgba(167,139,250,.1)',
+  purple:       'var(--purple-text, #a78bfa)',
+  purpleBg:     'var(--purple-bg, rgba(167,139,250,.1))',
 };
 
-/* ─── Global CSS with Light and Dark Tokens ─── */
+/* ─── Global CSS with Light ("Warm Clay") and Dark Tokens ─── */
 export const GLOBAL_CSS = `
   *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -47,48 +47,61 @@ export const GLOBAL_CSS = `
     --primary-hover: #0ea5e9;
     --primary-bg: rgba(56, 189, 248, 0.12);
     --primary-border: rgba(56, 189, 248, 0.3);
+    --badge-ready-solid: #10b981;
     --badge-ready-bg: rgba(16, 185, 129, 0.12);
-    --badge-ready-text: #10b981;
+    --badge-ready-text: #34d399;
     --badge-ready-border: rgba(16, 185, 129, 0.3);
+    --badge-capped-solid: #ef4444;
     --badge-capped-bg: rgba(239, 68, 68, 0.12);
     --badge-capped-text: #f87171;
     --badge-capped-border: rgba(239, 68, 68, 0.3);
+    --badge-paused-solid: #f59e0b;
     --badge-paused-bg: rgba(245, 158, 11, 0.12);
     --badge-paused-text: #fbbf24;
     --badge-paused-border: rgba(245, 158, 11, 0.3);
+    --purple-text: #a78bfa;
+    --purple-bg: rgba(167, 139, 250, 0.12);
     --shadow-card: 0 4px 20px rgba(0,0,0,0.4);
     --bar-bg: #1e293b;
     --bar-fill: #38bdf8;
     --scrollbar-thumb: #334155;
+    --card-radius: 14px;
   }
 
+  /* ─── Light Theme: "Warm Clay" (from light-theme.json) ─── */
   :root[data-theme="light"] {
-    --bg-page: #f1f5f9;
-    --bg-surface: #ffffff;
-    --bg-surface-elevated: #f8fafc;
-    --bg-input: #ffffff;
-    --border-subtle: #e2e8f0;
-    --border-highlight: #cbd5e1;
-    --text-main: #0f172a;
-    --text-muted: #475569;
-    --text-dim: #64748b;
-    --primary: #0284c7;
-    --primary-hover: #0369a1;
-    --primary-bg: #e0f2fe;
-    --primary-border: #bae6fd;
-    --badge-ready-bg: #ecfdf5;
-    --badge-ready-text: #059669;
-    --badge-ready-border: #a7f3d0;
-    --badge-capped-bg: #fef2f2;
-    --badge-capped-text: #dc2626;
-    --badge-capped-border: #fecaca;
-    --badge-paused-bg: #fffbeb;
-    --badge-paused-text: #d97706;
-    --badge-paused-border: #fde68a;
-    --shadow-card: 0 2px 12px rgba(15, 23, 42, 0.06);
-    --bar-bg: #e2e8f0;
-    --bar-fill: #0284c7;
-    --scrollbar-thumb: #cbd5e1;
+    --bg-page: #F5F0EA;
+    --bg-surface: #FCF9F6;
+    --bg-surface-elevated: #EDE5DC;
+    --bg-input: #F5F0EA;
+    --border-subtle: #E8DDD2;
+    --border-highlight: #857565;
+    --text-main: #3D3630;
+    --text-muted: #5A524A;
+    --text-dim: #7A7068;
+    --primary: #B45F3A;
+    --primary-hover: #964B2B;
+    --primary-bg: #F2E9DD;
+    --primary-border: #B45F3A;
+    --badge-ready-solid: #5FA968;
+    --badge-ready-bg: rgba(95, 169, 104, 0.15);
+    --badge-ready-text: #3B8244;
+    --badge-ready-border: rgba(95, 169, 104, 0.42);
+    --badge-capped-solid: #B45F3A;
+    --badge-capped-bg: rgba(180, 95, 58, 0.14);
+    --badge-capped-text: #B45F3A;
+    --badge-capped-border: rgba(180, 95, 58, 0.42);
+    --badge-paused-solid: #C68A3A;
+    --badge-paused-bg: rgba(198, 138, 58, 0.15);
+    --badge-paused-text: #9A6524;
+    --badge-paused-border: rgba(166, 123, 91, 0.42);
+    --purple-text: #7A5F9E;
+    --purple-bg: rgba(122, 95, 158, 0.14);
+    --shadow-card: 0 4px 18px rgba(61, 54, 48, 0.07);
+    --bar-bg: #EDE5DC;
+    --bar-fill: #B45F3A;
+    --scrollbar-thumb: #A67B5B;
+    --card-radius: 20px;
   }
 
   body {
@@ -138,11 +151,14 @@ export const GLOBAL_CSS = `
   .card {
     background: var(--bg-surface);
     border: 1px solid var(--border-subtle);
-    border-radius: 14px;
+    border-radius: var(--card-radius, 14px);
     box-shadow: var(--shadow-card);
     transition: transform .2s ease, box-shadow .2s ease, border-color .2s ease;
     position: relative;
     overflow: hidden;
+  }
+  :root[data-theme="light"] .card {
+    border-color: rgba(133, 117, 101, 0.35);
   }
   .card:hover {
     border-color: var(--border-highlight);
@@ -238,6 +254,22 @@ export const GLOBAL_CSS = `
   .tbl tbody tr { transition: background .15s ease; }
   .tbl tbody tr:hover { background: var(--primary-bg); }
   .tbl tbody tr:last-child td { border-bottom: none; }
+
+  /* Warm Clay Light Mode Table Styling (from light-theme.json) */
+  :root[data-theme="light"] .tbl th,
+  :root[data-theme="light"] .card table thead tr th {
+    background: #B45F3A !important;
+    color: #FCF9F6 !important;
+    border-bottom: 1px solid #964B2B !important;
+  }
+  :root[data-theme="light"] .tbl tbody tr:nth-child(even),
+  :root[data-theme="light"] .card table tbody tr:nth-child(even) {
+    background-color: #F5F0EA;
+  }
+  :root[data-theme="light"] .tbl tbody tr:hover,
+  :root[data-theme="light"] .card table tbody tr:hover {
+    background-color: #F2E9DD !important;
+  }
 
   /* ─── Badge ─── */
   .badge {

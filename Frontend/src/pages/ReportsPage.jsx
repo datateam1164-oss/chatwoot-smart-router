@@ -86,12 +86,12 @@ export default function ReportsPage() {
     loadReport(false);
   }, [loadReport]);
 
-  // Auto-refresh timer every 30 seconds if enabled
+  // Auto-refresh timer every 2 minutes (120 seconds) if enabled
   useEffect(() => {
     if (!autoRefresh) return;
     const interval = setInterval(() => {
       loadReport(true);
-    }, 30000);
+    }, 120000);
     return () => clearInterval(interval);
   }, [autoRefresh, loadReport]);
 
@@ -540,7 +540,7 @@ export default function ReportsPage() {
               onChange={(e) => setAutoRefresh(e.target.checked)}
               style={{ accentColor: C.accent, cursor: 'pointer' }}
             />
-            <span>تحديث تلقائي (30ث)</span>
+            <span>تحديث تلقائي (دقيقتين)</span>
           </label>
 
           {/* Refresh Button */}

@@ -458,6 +458,19 @@ def get_all_agents_today_chats_counts():
     conn.close()
     return counts
 
+def get_all_agents_pulled_counts_today():
+    conn = get_db()
+    cursor = conn.cursor()
+    today_prefix = datetime.now(CAIRO_TZ).strftime("%Y-%m-%d")
+    cursor.execute("""
+        SELECT agent_id, COUNT(*) as cnt FROM chats_log 
+        WHERE assigned_at LIKE ? AND status = 'pulled'
+        GROUP BY agent_id
+    """, (f"{today_prefix}%",))
+    counts = {str(r["agent_id"]): int(r["cnt"]) for r in cursor.fetchall()}
+    conn.close()
+    return counts
+
 def mark_chats_as_pulled(cids):
     if not cids: return
     conn = get_db()
@@ -552,28 +565,39 @@ def update_agent_active_chats(agent_id, count):
 
 def check_and_reset_agent_window(agent_row, window_minutes=30):
     now = datetime.now(CAIRO_TZ)
-    window_start_str = agent_row.get("window_start_time")
-    
-    if not window_start_str:
+    cutoff_str = (now - timedelta(minutes=window_minutes)).isoformat()
+    aid_str = str(agent_row.get("id", ""))
+    if not aid_str:
         return agent_row
-        
+
     try:
-        window_start = datetime.fromisoformat(window_start_str)
-        if now - window_start >= timedelta(minutes=window_minutes):
-            conn = get_db()
-            cursor = conn.cursor()
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT COUNT(*) as cnt, MIN(assigned_at) as oldest_ts
+            FROM chats_log
+            WHERE agent_id = ? AND assigned_at >= ? AND status = 'assigned'
+        """, (aid_str, cutoff_str))
+        row = cursor.fetchone()
+        rolling_cnt = int(row["cnt"] or 0) if row else 0
+        oldest_ts = row["oldest_ts"] if (row and rolling_cnt > 0) else None
+
+        curr_db_cnt = int(agent_row.get("current_window_chats") or 0)
+        curr_db_win = agent_row.get("window_start_time")
+
+        if rolling_cnt != curr_db_cnt or oldest_ts != curr_db_win:
             cursor.execute("""
-                UPDATE agents 
-                SET current_window_chats = 0, window_start_time = NULL 
+                UPDATE agents
+                SET current_window_chats = ?, window_start_time = ?
                 WHERE id = ?
-            """, (str(agent_row["id"]),))
+            """, (rolling_cnt, oldest_ts, aid_str))
             conn.commit()
-            conn.close()
-            agent_row["current_window_chats"] = 0
-            agent_row["window_start_time"] = None
+            agent_row["current_window_chats"] = rolling_cnt
+            agent_row["window_start_time"] = oldest_ts
+        conn.close()
     except Exception:
         pass
-            
+
     return agent_row
 
 def increment_agent_window_chats(agent_id):

@@ -95,22 +95,18 @@ export default function ReportsPage() {
     return () => clearInterval(interval);
   }, [autoRefresh, loadReport]);
 
-  // Available labels for Smart Reassign + count of delayed chats per label
+  // Available Sales labels for Smart Reassign + count of delayed chats per label
   const availableLabelsForReassign = useMemo(() => {
     const labelMap = new Map();
     const configured = report?.configured_sales_labels || [];
+    const configuredLowerSet = new Set(configured.map(l => String(l || '').trim().toLowerCase()).filter(Boolean));
+
     configured.forEach(lbl => {
       const clean = String(lbl || '').trim();
-      if (clean && !labelMap.has(clean)) {
-        labelMap.set(clean, { label: clean, delayedCount: 0, totalPending: 0 });
+      if (clean && !labelMap.has(clean.toLowerCase())) {
+        labelMap.set(clean.toLowerCase(), { label: clean, delayedCount: 0, totalPending: 0 });
       }
     });
-
-    // Always include Unlabeled option
-    const UNLABELED_KEY = 'unlabeled';
-    if (!labelMap.has(UNLABELED_KEY)) {
-      labelMap.set(UNLABELED_KEY, { label: UNLABELED_KEY, displayTitle: 'بدون ليبل (Unlabeled)', delayedCount: 0, totalPending: 0 });
-    }
 
     const pending = report?.pending_chats || [];
     const minDelay = Number(reassignConfig.min_delay_minutes || 15);
@@ -118,30 +114,25 @@ export default function ReportsPage() {
     pending.forEach(ch => {
       const isDelayed = Number(ch.delay_minutes || 0) >= minDelay;
       const cLabels = Array.isArray(ch.labels) ? ch.labels.filter(Boolean) : [];
-      if (cLabels.length === 0) {
-        const entry = labelMap.get(UNLABELED_KEY);
-        if (entry) {
-          entry.totalPending += 1;
-          if (isDelayed) entry.delayedCount += 1;
+      cLabels.forEach(rawL => {
+        const clean = String(rawL).trim();
+        const lower = clean.toLowerCase();
+        if (!clean) return;
+        // Only include configured Sales labels (or all if none configured yet)
+        if (configuredLowerSet.size > 0 && !configuredLowerSet.has(lower)) return;
+        if (!labelMap.has(lower)) {
+          labelMap.set(lower, { label: clean, delayedCount: 0, totalPending: 0 });
         }
-      } else {
-        cLabels.forEach(rawL => {
-          const clean = String(rawL).trim();
-          if (!clean) return;
-          if (!labelMap.has(clean)) {
-            labelMap.set(clean, { label: clean, delayedCount: 0, totalPending: 0 });
-          }
-          const entry = labelMap.get(clean);
-          entry.totalPending += 1;
-          if (isDelayed) entry.delayedCount += 1;
-        });
-      }
+        const entry = labelMap.get(lower);
+        entry.totalPending += 1;
+        if (isDelayed) entry.delayedCount += 1;
+      });
     });
 
     return Array.from(labelMap.values()).sort((a, b) => (b.delayedCount - a.delayedCount) || (b.totalPending - a.totalPending));
   }, [report, reassignConfig.min_delay_minutes]);
 
-  // Count how many delayed chats match the currently selected pullable labels
+  // Count how many delayed chats match the currently selected pullable Sales labels
   const matchingPullableChats = useMemo(() => {
     const pending = report?.pending_chats || [];
     const selectedSet = new Set((reassignConfig.labels || []).map(l => String(l).trim().toLowerCase()));
@@ -176,7 +167,12 @@ export default function ReportsPage() {
       if (res && res.config) {
         setReassignConfig(res.config);
       }
-      showNotification('✅ تم حفظ إعدادات السحب والتحويل الذكي بنجاح', 'success');
+      showNotification(
+        customCfg && 'auto_enabled' in customCfg
+          ? (customCfg.auto_enabled ? '🟢 تم تشغيل السحب التلقائي للشاتات المتأخرة بنجاح' : '🛑 تم إيقاف السحب التلقائي للشاتات المتأخرة')
+          : '✅ تم حفظ إعدادات السحب والتحويل الذكي بنجاح',
+        'success'
+      );
     } catch (err) {
       showNotification(err.message || 'فشل حفظ الإعدادات', 'error');
     } finally {
@@ -186,7 +182,7 @@ export default function ReportsPage() {
 
   const handleExecuteBulkSmartReassign = async () => {
     if (!reassignConfig.labels || reassignConfig.labels.length === 0) {
-      showNotification('⚠️ يرجى اختيار ليبل واحد على الأقل من الليبلات المسموح بسحبها أولاً', 'error');
+      showNotification('⚠️ يرجى اختيار ليبل سيلز واحد على الأقل من الليبلات المسموح بسحبها أولاً', 'error');
       return;
     }
     setExecutingReassign(true);
@@ -220,13 +216,13 @@ export default function ReportsPage() {
       if (res && res.reassigned_count > 0 && res.transfers && res.transfers[0]) {
         const tr = res.transfers[0];
         showNotification(
-          `⚡ تم تحويل الشات #${tr.conv_id} من (${tr.from_agent_name}) إلى (${tr.to_agent_name} | السكور: ${tr.to_agent_score > 0 ? '+' + tr.to_agent_score : tr.to_agent_score} | مفتوح: ${tr.to_agent_open_chats})`,
+          `⚡ تم فحص وسحب الشات #${tr.conv_id} من (${tr.from_agent_name}) إلى (${tr.to_agent_name} | السكور: +${tr.to_agent_score} | الـ30د: ${tr.to_agent_window_chats || 'متاح'})`,
           'success'
         );
         loadReport(true);
       } else {
-        const reason = res?.skipped?.[0]?.reason || res?.message || 'لم يتم العثور على موظف متاح تحت سقف الشاتات';
-        showNotification(`⚠️ تعذر تحويل الشات #${chat.conv_id}: ${reason}`, 'error');
+        const reason = res?.skipped?.[0]?.reason || res?.message || 'لم يتم العثور على موظف متاح ضمن سقف الـ 30 دقيقة واليوم';
+        showNotification(`⚠️ لم يتم سحب الشات #${chat.conv_id}: ${reason}`, 'error');
       }
     } catch (err) {
       showNotification(err.message || 'فشل تحويل المحادثة للأفضل', 'error');
@@ -710,13 +706,13 @@ export default function ReportsPage() {
         </div>
       </div>
 
-      {/* ── Smart Delayed Reassignment Engine (سحب المتأخرات وتوزيعها للأعلى سكور والأقل شاتات حسب الليبلات المختارة) ── */}
+      {/* ── Smart Delayed Reassignment Engine (سحب المتأخرات وتوزيعها للأعلى سكور ضمن سقف الـ 30 دقيقة واليوم + فحص لحظي قبل السحب) ── */}
       <div style={{
         background: 'linear-gradient(135deg, rgba(16,185,129,0.06) 0%, rgba(56,189,248,0.06) 50%, rgba(168,85,247,0.06) 100%)',
         borderRadius: 16,
         padding: '18px 20px',
         marginBottom: 20,
-        border: '1px solid rgba(56,189,248,0.28)',
+        border: reassignConfig.auto_enabled ? '1px solid rgba(16,185,129,0.55)' : '1px solid rgba(56,189,248,0.28)',
         display: 'flex',
         flexDirection: 'column',
         gap: 14
@@ -724,59 +720,99 @@ export default function ReportsPage() {
         {/* Header Row */}
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-            <span style={{ fontSize: 20 }}>⚡</span>
+            <span style={{ fontSize: 22 }}>⚡</span>
             <div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                 <strong style={{ fontSize: 15, color: C.textBright }}>
-                  سحب وإعادة توزيع الشاتات المتأخرة ذكياً (للأعلى سكور والأقل شاتات داخل الشيفت)
+                  سحب وإعادة توجيه الشاتات المتأخرة (لليبلات السيلز المحددة فقط ⬅️ للأعلى سكور ضمن سقف الـ 30 دقيقة واليوم)
                 </strong>
                 <span style={{
                   fontSize: 11,
-                  padding: '2px 9px',
+                  padding: '3px 10px',
                   borderRadius: 8,
-                  background: reassignConfig.auto_enabled ? 'rgba(16,185,129,0.2)' : 'rgba(148,163,184,0.14)',
-                  color: reassignConfig.auto_enabled ? C.greenLight : C.textDim,
-                  border: `1px solid ${reassignConfig.auto_enabled ? 'rgba(16,185,129,0.5)' : 'rgba(148,163,184,0.25)'}`,
-                  fontWeight: 700
+                  background: reassignConfig.auto_enabled ? 'rgba(16,185,129,0.22)' : 'rgba(239,68,68,0.14)',
+                  color: reassignConfig.auto_enabled ? C.greenLight : C.redLight,
+                  border: `1px solid ${reassignConfig.auto_enabled ? 'rgba(16,185,129,0.55)' : C.redBorder}`,
+                  fontWeight: 800
                 }}>
-                  {reassignConfig.auto_enabled ? '🟢 السحب التلقائي مفعّل' : '⚪ وضع التحكم اليدوي'}
+                  {reassignConfig.auto_enabled ? '🟢 السحب التلقائي شغّال' : '🛑 السحب التلقائي متوقف'}
                 </span>
               </div>
-              <div style={{ fontSize: 11, color: C.textDim, marginTop: 3 }}>
-                يسحب الشات المتأخر فقط إذا كان يحمل أحد <strong style={{ color: C.accent }}>الليبلات المختارة بالأسفل</strong>، ويحوّله لأفضل موظف متاح في الشيفت يوازن بين <strong style={{ color: C.greenLight }}>أعلى سكور سرعة</strong> و<strong style={{ color: C.yellowLight }}>أقل عدد شاتات مفتوحة</strong> (حتى لا يتكدس موظف بـ 80 شات وآخر بـ 30).
+              <div style={{ fontSize: 11, color: C.textDim, marginTop: 4 }}>
+                🔍 <strong style={{ color: C.accent }}>فحص لحظي قبل السحب:</strong> يتأكد النظام من Chatwoot في نفس الثانية أن الموظف لم يرد ولم يكتب Private Note قبل سحب الشات، ثم يوجهه لـ <strong style={{ color: C.greenLight }}>الموظف رقم #1 في السكور</strong> بشرط عدم تخطي <strong style={{ color: C.yellowLight }}>سقف الـ 30 دقيقة المتحرك</strong> ولا <strong style={{ color: C.yellowLight }}>سقف اليوم الكامل</strong>.
               </div>
             </div>
           </div>
 
-          {/* Action Buttons */}
+          {/* Action Buttons: Prominent Start/Stop Auto-Pull + Manual Execute + Save */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <button
+              onClick={() => {
+                if (!reassignConfig.auto_enabled && (!reassignConfig.labels || reassignConfig.labels.length === 0)) {
+                  showNotification('⚠️ اختر ليبل سيلز واحد على الأقل أولاً قبل تشغيل السحب التلقائي', 'error');
+                  return;
+                }
+                const nextVal = !reassignConfig.auto_enabled;
+                const nextCfg = { ...reassignConfig, auto_enabled: nextVal };
+                setReassignConfig(nextCfg);
+                handleSaveSmartReassignConfig(nextCfg);
+              }}
+              disabled={savingReassignConfig}
+              className="btn"
+              style={{
+                background: reassignConfig.auto_enabled
+                  ? 'linear-gradient(135deg, #ef4444, #dc2626)'
+                  : 'linear-gradient(135deg, #10b981, #059669)',
+                color: '#fff',
+                border: reassignConfig.auto_enabled ? '1px solid rgba(239,68,68,0.7)' : '1px solid rgba(16,185,129,0.7)',
+                fontWeight: 800,
+                fontSize: 13,
+                padding: '9px 18px',
+                borderRadius: 10,
+                cursor: savingReassignConfig ? 'not-allowed' : 'pointer',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 7,
+                boxShadow: reassignConfig.auto_enabled
+                  ? '0 4px 14px rgba(239,68,68,0.28)'
+                  : '0 4px 14px rgba(16,185,129,0.28)'
+              }}
+              title={reassignConfig.auto_enabled ? 'اضغط لإيقاف السحب التلقائي فوراً' : 'اضغط لتشغيل السحب التلقائي للشاتات المتأخرة في الليبلات المحددة'}
+            >
+              <span>{reassignConfig.auto_enabled ? '🛑' : '▶️'}</span>
+              <span>
+                {reassignConfig.auto_enabled
+                  ? 'إيقاف السحب التلقائي'
+                  : 'تشغيل السحب التلقائي'}
+              </span>
+            </button>
+
             <button
               onClick={handleExecuteBulkSmartReassign}
               disabled={executingReassign || loading || matchingPullableChats.length === 0}
               className="btn"
               style={{
                 background: matchingPullableChats.length > 0
-                  ? 'linear-gradient(135deg, #10b981, #059669)'
+                  ? 'rgba(56,189,248,0.18)'
                   : 'rgba(255,255,255,0.06)',
-                color: matchingPullableChats.length > 0 ? '#fff' : C.textDim,
-                border: matchingPullableChats.length > 0 ? '1px solid rgba(16,185,129,0.6)' : `1px solid ${C.border}`,
+                color: matchingPullableChats.length > 0 ? C.accent : C.textDim,
+                border: matchingPullableChats.length > 0 ? `1px solid ${C.accentBorder}` : `1px solid ${C.border}`,
                 fontWeight: 800,
-                fontSize: 13,
-                padding: '8px 16px',
+                fontSize: 12,
+                padding: '9px 14px',
                 borderRadius: 10,
                 cursor: (executingReassign || matchingPullableChats.length === 0) ? 'not-allowed' : 'pointer',
                 display: 'inline-flex',
                 alignItems: 'center',
-                gap: 7,
-                boxShadow: matchingPullableChats.length > 0 ? '0 4px 14px rgba(16,185,129,0.25)' : 'none'
+                gap: 6
               }}
-              title="سحب جميع الشاتات المتأخرة المطابقة لليبلات المختارة وتحويلها للأعلى سكور والأقل شاتات فوراً"
+              title="تنفيذ دورة فحص لحظي وسحب فوري الآن للشاتات المتأخرة المطابقة لليبلات المختارة"
             >
               <span>{executingReassign ? '⏳' : '🚀'}</span>
               <span>
                 {executingReassign
-                  ? 'جاري السحب والتحويل...'
-                  : `سحب وتحويل المتأخرات المختارة الآن (${matchingPullableChats.length} شات)`}
+                  ? 'جاري الفحص والسحب...'
+                  : `سحب فوري الآن (${matchingPullableChats.length} شات)`}
               </span>
             </button>
 
@@ -785,18 +821,18 @@ export default function ReportsPage() {
               disabled={savingReassignConfig}
               className="btn"
               style={{
-                background: 'rgba(56,189,248,0.14)',
-                color: C.accent,
-                border: `1px solid ${C.accentBorder}`,
+                background: 'rgba(255,255,255,0.06)',
+                color: C.textBright,
+                border: `1px solid ${C.border}`,
                 fontWeight: 700,
                 fontSize: 12,
-                padding: '8px 13px',
+                padding: '9px 13px',
                 borderRadius: 10,
                 cursor: savingReassignConfig ? 'not-allowed' : 'pointer'
               }}
-              title="حفظ اختيارات الليبلات والضوابط في قاعدة البيانات"
+              title="حفظ اختيارات ليبلات السيلز ووقت السحب"
             >
-              {savingReassignConfig ? '⏳ جاري الحفظ...' : '💾 حفظ الإعدادات'}
+              {savingReassignConfig ? '⏳...' : '💾 حفظ'}
             </button>
 
             {reassignHistory.length > 0 && (
@@ -809,18 +845,18 @@ export default function ReportsPage() {
                   border: `1px solid ${showReassignHistory ? 'rgba(168,85,247,0.5)' : C.border}`,
                   fontWeight: 700,
                   fontSize: 12,
-                  padding: '8px 12px',
+                  padding: '9px 12px',
                   borderRadius: 10,
                   cursor: 'pointer'
                 }}
               >
-                📜 سجل التحويلات ({reassignHistory.length})
+                📜 السجل ({reassignHistory.length})
               </button>
             )}
           </div>
         </div>
 
-        {/* Row 2: Selectable Pullable Labels (اختيار الليبلات المسموح بسحبها فقط) */}
+        {/* Row 2: Selectable Sales Pullable Labels (اختيار ليبلات السيلز المسموح بسحبها فقط) */}
         <div style={{
           background: 'rgba(15,23,42,0.55)',
           padding: '12px 14px',
@@ -830,10 +866,10 @@ export default function ReportsPage() {
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8, marginBottom: 10 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
               <span style={{ fontSize: 13, fontWeight: 800, color: C.textBright }}>
-                🏷️ اختر الليبلات (البولات) المطلوب سحبها عند التأخير:
+                🏷️ ليبلات السيلز فقط — اختر منها الليبلات المطلوب سحبها عند التأخير:
               </span>
               <span style={{ fontSize: 11, color: C.textDim }}>
-                (محدد حالياً: <strong style={{ color: C.accent }}>{reassignConfig.labels.length}</strong> ليبل — الشاتات غير المحددة هنا تُترك مع موظفها حتى لو تأخر)
+                (محدد للسحب: <strong style={{ color: C.accent }}>{reassignConfig.labels.length}</strong> من {availableLabelsForReassign.length} ليبل سيلز — أي ليبل غير محدد هنا يُترك مع موظفه)
               </span>
             </div>
 
@@ -851,7 +887,7 @@ export default function ReportsPage() {
                   fontWeight: 700
                 }}
               >
-                تحديد الكل
+                تحديد كل ليبلات السيلز
               </button>
               <button
                 onClick={() => setReassignConfig(prev => ({ ...prev, labels: [] }))}
@@ -921,12 +957,12 @@ export default function ReportsPage() {
           </div>
         </div>
 
-        {/* Row 3: Threshold & Load Balancing Controls */}
+        {/* Row 3: Delay Trigger & Capacity Reference Rule */}
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 14 }}>
           {/* Min Delay Threshold */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
             <span style={{ fontSize: 12, color: C.textDim, fontWeight: 600 }}>⏱️ سحب الشات بعد تأخير:</span>
-            {[10, 15, 20, 30, 45].map(mins => (
+            {[10, 15, 20, 30].map(mins => (
               <button
                 key={mins}
                 onClick={() => setReassignConfig(prev => ({ ...prev, min_delay_minutes: mins }))}
@@ -946,76 +982,40 @@ export default function ReportsPage() {
             ))}
           </div>
 
-          {/* Max Open Chats Cap for Receiver */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-            <span style={{ fontSize: 12, color: C.textDim, fontWeight: 600 }} title="لا يتم إرسال شات مسحوب لموظف وصل عدد الشاتات المفتوحة عنده لهذا السقف حتى لو كان سكوره عالياً">
-              ⚖️ سقف الشاتات المفتوحة للمستلم:
-            </span>
-            {[25, 35, 45, 55, 70].map(cap => (
-              <button
-                key={cap}
-                onClick={() => setReassignConfig(prev => ({ ...prev, max_open_chats: cap }))}
-                style={{
-                  padding: '4px 10px',
-                  borderRadius: 7,
-                  fontSize: 11,
-                  fontWeight: 700,
-                  cursor: 'pointer',
-                  background: Number(reassignConfig.max_open_chats) === cap ? 'rgba(56,189,248,0.2)' : 'rgba(255,255,255,0.04)',
-                  color: Number(reassignConfig.max_open_chats) === cap ? C.accent : C.textDim,
-                  border: Number(reassignConfig.max_open_chats) === cap ? `1px solid ${C.accentBorder}` : '1px solid transparent'
-                }}
-              >
-                أقل من {cap} شات
-              </button>
-            ))}
+          {/* Capacity Reference Badge */}
+          <div style={{
+            fontSize: 11,
+            color: C.textMuted,
+            background: 'rgba(56,189,248,0.08)',
+            padding: '5px 12px',
+            borderRadius: 8,
+            border: '1px solid rgba(56,189,248,0.22)',
+            fontWeight: 600
+          }}>
+            🎯 مرجع السعة عند التحويل: <strong style={{ color: C.accent }}>سقف الـ 30 دقيقة للموظف</strong> (سواء 20 أو 10 أو 5) ثم <strong style={{ color: C.greenLight }}>سقف اليوم الكامل</strong>
           </div>
 
-          {/* Match Agent Label & Auto-Reassign Toggle */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-            <label style={{
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: 6,
-              fontSize: 12,
-              color: C.textBright,
-              cursor: 'pointer',
-              background: 'rgba(255,255,255,0.04)',
-              padding: '5px 10px',
-              borderRadius: 8,
-              border: `1px solid ${C.borderLight}`
-            }}>
-              <input
-                type="checkbox"
-                checked={Boolean(reassignConfig.match_agent_label)}
-                onChange={(e) => setReassignConfig(prev => ({ ...prev, match_agent_label: e.target.checked }))}
-                style={{ accentColor: C.accent, cursor: 'pointer' }}
-              />
-              <span>مطابقة ليبل/تخصص الموظف</span>
-            </label>
-
-            <button
-              onClick={() => {
-                const nextVal = !reassignConfig.auto_enabled;
-                const nextCfg = { ...reassignConfig, auto_enabled: nextVal };
-                setReassignConfig(nextCfg);
-                handleSaveSmartReassignConfig(nextCfg);
-              }}
-              style={{
-                padding: '5px 12px',
-                borderRadius: 8,
-                fontSize: 12,
-                fontWeight: 700,
-                cursor: 'pointer',
-                background: reassignConfig.auto_enabled ? 'rgba(16,185,129,0.22)' : 'rgba(255,255,255,0.04)',
-                color: reassignConfig.auto_enabled ? C.greenLight : C.textDim,
-                border: reassignConfig.auto_enabled ? '1px solid rgba(16,185,129,0.55)' : `1px solid ${C.border}`
-              }}
-              title="عند التفعيل يقوم النظام كل دقيقتين بفحص الشاتات المتأخرة من الليبلات المحددة فقط وتحويلها للأعلى سكور والأقل شاتات في الشيفت تلقائياً"
-            >
-              {reassignConfig.auto_enabled ? '🤖 السحب التلقائي: مفعّل (كل دقيقتين)' : '🤖 تفعيل السحب التلقائي كل دقيقتين'}
-            </button>
-          </div>
+          {/* Match Agent Label Checkbox */}
+          <label style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 6,
+            fontSize: 12,
+            color: C.textBright,
+            cursor: 'pointer',
+            background: 'rgba(255,255,255,0.04)',
+            padding: '5px 10px',
+            borderRadius: 8,
+            border: `1px solid ${C.borderLight}`
+          }}>
+            <input
+              type="checkbox"
+              checked={Boolean(reassignConfig.match_agent_label)}
+              onChange={(e) => setReassignConfig(prev => ({ ...prev, match_agent_label: e.target.checked }))}
+              style={{ accentColor: C.accent, cursor: 'pointer' }}
+            />
+            <span>مطابقة ليبل/تخصص الموظف</span>
+          </label>
         </div>
 
         {/* Collapsible Recent Smart Reassign History */}
@@ -1029,7 +1029,7 @@ export default function ReportsPage() {
             overflowY: 'auto'
           }}>
             <div style={{ fontSize: 12, fontWeight: 800, color: C.purple, marginBottom: 8 }}>
-              📜 آخر التحويلات الذكية المنفذة (من المتأخر ⬅️ للأعلى سكور والأقل شاتات):
+              📜 آخر التحويلات الذكية المنفذة (بعد الفحص اللحظي ⬅️ للأعلى سكور ضمن سقف الـ 30 دقيقة):
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
               {reassignHistory.map((item, idx) => (
@@ -1060,10 +1060,10 @@ export default function ReportsPage() {
                       🏷️ {item.label}
                     </span>
                     <span style={{ color: C.textDim }}>تأخير: {item.delay_minutes} د</span>
-                    <span style={{ color: C.redLight }}>من: <strong>{item.from_agent_name}</strong></span>
+                    <span style={{ color: C.redLight }}>من: <strong>{item.from_agent_name}</strong> (0 نقطة)</span>
                     <span>⬅️</span>
                     <span style={{ color: C.greenLight }}>
-                      إلى: <strong>{item.to_agent_name}</strong> (السكور: {item.to_agent_score > 0 ? `+${item.to_agent_score}` : item.to_agent_score} | مفتوح: {item.to_agent_open_chats})
+                      إلى: <strong>{item.to_agent_name}</strong> (السكور: +{item.to_agent_score} | الـ30د: {item.to_agent_window_chats || item.to_agent_open_chats})
                     </span>
                   </div>
                   <span style={{ fontSize: 11, color: C.textDim, direction: 'ltr' }}>{item.timestamp}</span>
@@ -1372,7 +1372,7 @@ export default function ReportsPage() {
                   filteredChats.map((chat) => {
                     const isCritical = chat.severity === 'critical';
                     const isWarning = chat.severity === 'warning';
-                    const pts = chat.points_impact !== undefined ? chat.points_impact : (isCritical ? -1 : 1);
+                    const pts = chat.points_impact !== undefined ? chat.points_impact : (isCritical ? 0 : (isWarning ? 5 : 7));
 
                     return (
                       <tr
@@ -1402,6 +1402,21 @@ export default function ReportsPage() {
                             <span>#{chat.conv_id}</span>
                             <span style={{ fontSize: 11, opacity: 0.7 }}>↗</span>
                           </a>
+                          {chat.reassigned_from && (
+                            <div style={{
+                              marginTop: 4,
+                              fontSize: 10,
+                              padding: '2px 6px',
+                              borderRadius: 5,
+                              background: 'rgba(16,185,129,0.14)',
+                              color: C.greenLight,
+                              border: '1px solid rgba(16,185,129,0.35)',
+                              fontWeight: 700,
+                              display: 'inline-block'
+                            }} title={`تم تحويل هذا الشات من ${chat.reassigned_from.from_agent_name} بعد تأخير ${chat.reassigned_from.delay_minutes} د`}>
+                              ⚡ محوّل من {chat.reassigned_from.from_agent_name}
+                            </div>
+                          )}
                         </td>
 
                         {/* Labels / Categories */}
@@ -1521,7 +1536,7 @@ export default function ReportsPage() {
                               fontSize: 11,
                               fontWeight: 700
                             }}>
-                              🔴 تأخير حرج ({pts} نقطة)
+                              🔴 تأخير حرج (0 نقطة - يُسحب)
                             </span>
                           ) : isWarning ? (
                             <span style={{
@@ -1534,7 +1549,7 @@ export default function ReportsPage() {
                               fontSize: 11,
                               fontWeight: 700
                             }}>
-                              🟡 أقل من 15 د (+1 نقطة)
+                              🟡 معقول 6-15 د (+{pts} نقاط)
                             </span>
                           ) : (
                             <span style={{
@@ -1547,7 +1562,7 @@ export default function ReportsPage() {
                               fontSize: 11,
                               fontWeight: 700
                             }}>
-                              🟢 طبيعي (+1 نقطة)
+                              🟢 سريع &le;5 د (+{pts} نقاط)
                             </span>
                           )}
                         </td>
@@ -1568,7 +1583,7 @@ export default function ReportsPage() {
                                 padding: '4px 9px',
                                 cursor: reassigningConvId === chat.conv_id ? 'not-allowed' : 'pointer'
                               }}
-                              title="سحب هذا الشات فوراً وتحويله لأفضل موظف في الشيفت (الأعلى سكور والأقل شاتات مفتوحة)"
+                              title="سحب هذا الشات فوراً وتحويله لأفضل موظف في الشيفت (الأعلى سكور وفي حدود سقف الـ 30 دقيقة واليوم)"
                             >
                               <span>{reassigningConvId === chat.conv_id ? '⏳' : '⚡'}</span>
                               <span>{reassigningConvId === chat.conv_id ? 'جاري التحويل...' : 'تحويل للأفضل'}</span>
@@ -1614,7 +1629,7 @@ export default function ReportsPage() {
           }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
               <span style={{ fontSize: 18 }}>🏆</span>
-              <strong style={{ fontSize: 16, color: C.textBright }}>سكور السيلز وملخص سرعة الاستجابة</strong>
+              <strong style={{ fontSize: 16, color: C.textBright }}>سكور السيلز وملخص سرعة الاستجابة (ليبولات السيلز فقط)</strong>
               <span style={{ fontSize: 12, color: C.textDim }}>({filteredAgents.length} موظف نشط في العينة)</span>
             </div>
 
@@ -1666,13 +1681,11 @@ export default function ReportsPage() {
             fontSize: 11,
             color: C.textMuted
           }}>
-            <strong style={{ color: C.textBright }}>📌 قاعدة حساب السكور (لكل شات مفتوح):</strong>
-            <span style={{ color: '#38bdf8', fontWeight: 700 }}>⚡ رد خلال أول 5 د = +2 نقطة</span>
-            <span style={{ color: C.greenLight, fontWeight: 700 }}>🟢 حتى 15 د / مردود / معفي = +1 نقطة</span>
-            <span style={{ color: C.yellowLight, fontWeight: 700 }}>🟡 تأخير 15 - 30 د = -1 نقطة</span>
-            <span style={{ color: '#fb923c', fontWeight: 700 }}>🟠 تأخير 30 - 45 د = -2 نقطتين</span>
-            <span style={{ color: C.redLight, fontWeight: 700 }}>🔴 تأخير +45 د = -3 نقاط</span>
-            <span style={{ color: C.textDim, marginRight: 'auto' }}>🛡️ البرايفت نوت و"تمام/شكراً/لايك/استيكر" لا تُحسب تأخيراً</span>
+            <strong style={{ color: C.textBright }}>📌 قاعدة حساب السكور (شرائح النقاط):</strong>
+            <span style={{ color: '#38bdf8', fontWeight: 700 }}>⚡ شريحة السريع (0 إلى 5 دقائق) = +7 نقاط</span>
+            <span style={{ color: C.greenLight, fontWeight: 700 }}>🟢 شريحة المعقول (6 إلى 15 دقيقة / مردود) = +5 نقاط</span>
+            <span style={{ color: C.redLight, fontWeight: 700 }}>🔴 شريحة التأخير الحرج (+15 دقيقة بدون رد) = 0 نقاط + سحب الشات</span>
+            <span style={{ color: C.textDim, marginRight: 'auto' }}>🛡️ البرايفت نوت و"تمام/شكراً/لايك/استيكر" لا تُحسب تأخيراً ولا تُسحب</span>
           </div>
 
           <div style={{ overflowX: 'auto' }}>
@@ -1682,7 +1695,7 @@ export default function ReportsPage() {
                   <th style={{ padding: '12px 16px', fontWeight: 700 }}>الموظف</th>
                   <th style={{ padding: '12px 16px', fontWeight: 700 }}>التيم</th>
                   <th style={{ padding: '12px 16px', fontWeight: 700, textAlign: 'center' }}>🏆 السكور وتفاصيل النقاط</th>
-                  <th style={{ padding: '12px 16px', fontWeight: 700, textAlign: 'center' }}>حالة الشيفت</th>
+                  <th style={{ padding: '12px 16px', fontWeight: 700, textAlign: 'center' }}>حالة الشيفت والسقف</th>
                   <th style={{ padding: '12px 16px', fontWeight: 700, textAlign: 'center' }}>الشاتات المفتوحة</th>
                   <th style={{ padding: '12px 16px', fontWeight: 700, textAlign: 'center' }}>المعلقة الفعلي</th>
                   <th style={{ padding: '12px 16px', fontWeight: 700, textAlign: 'center' }}>تأخير حرج (15+ د)</th>
@@ -1706,6 +1719,7 @@ export default function ReportsPage() {
                     const scorePositive = score > 0;
                     const scoreNegative = score < 0;
                     const medal = agentSortBy === 'score_desc' ? (idx === 0 ? '🥇 ' : idx === 1 ? '🥈 ' : idx === 2 ? '🥉 ' : '') : '';
+                    const totalLateOver15 = (ag.delay_15_30_count || 0) + (ag.delay_30_45_count || 0) + (ag.delay_over_45_count || 0);
 
                     return (
                       <tr
@@ -1730,6 +1744,21 @@ export default function ReportsPage() {
                               غير مطابق بـ CRM (دعم)
                             </div>
                           ) : null}
+                          {(ag.pulled_today_count || 0) > 0 && (
+                            <div style={{
+                              marginTop: 4,
+                              display: 'inline-block',
+                              fontSize: 10,
+                              padding: '2px 6px',
+                              borderRadius: 5,
+                              background: ag.pulled_today_count >= 3 ? C.redBg : 'rgba(245,158,11,0.15)',
+                              color: ag.pulled_today_count >= 3 ? C.redLight : C.yellowLight,
+                              border: `1px solid ${ag.pulled_today_count >= 3 ? C.redBorder : 'rgba(245,158,11,0.35)'}`,
+                              fontWeight: 700
+                            }} title="عدد الشاتات التي تم سحبها من الموظف اليوم بسبب تخطي 15 دقيقة بدون رد">
+                              {ag.pulled_today_count >= 3 ? '🚨 تنبيه غياب: ' : '📥 '}سُحب منه اليوم: {ag.pulled_today_count} شات
+                            </div>
+                          )}
                         </td>
 
                         {/* Team */}
@@ -1763,13 +1792,13 @@ export default function ReportsPage() {
                           </div>
                           <div style={{ display: 'flex', justifyContent: 'center', flexWrap: 'wrap', gap: 4, marginTop: 5, fontSize: 10 }}>
                             {(ag.fast_5m_count || 0) > 0 && (
-                              <span style={{ padding: '1px 5px', borderRadius: 4, background: 'rgba(56,189,248,0.15)', color: C.accent, fontWeight: 700 }} title="شاتات تم الرد عليها خلال أول 5 دقائق (+2 نقطة لكل شات)">
-                                ⚡5د: {ag.fast_5m_count} (+{ag.fast_5m_count * 2})
+                              <span style={{ padding: '1px 5px', borderRadius: 4, background: 'rgba(56,189,248,0.15)', color: C.accent, fontWeight: 700 }} title="شريحة السريع: رد خلال 0 إلى 5 دقائق (+7 نقاط لكل شات)">
+                                ⚡0-5د: {ag.fast_5m_count} (+{ag.fast_5m_count * 7})
                               </span>
                             )}
                             {(ag.within_15m_count || 0) > 0 && (
-                              <span style={{ padding: '1px 5px', borderRadius: 4, background: 'rgba(16,185,129,0.12)', color: C.greenLight, fontWeight: 600 }} title="شاتات ملتزمة أقل من 15 دقيقة أو مردود عليها (+1 نقطة لكل شات)">
-                                🟢15د: {ag.within_15m_count} (+{ag.within_15m_count})
+                              <span style={{ padding: '1px 5px', borderRadius: 4, background: 'rgba(16,185,129,0.12)', color: C.greenLight, fontWeight: 600 }} title="شريحة المعقول: 6 إلى 15 دقيقة أو مردود عليها (+5 نقاط لكل شات)">
+                                🟢6-15د: {ag.within_15m_count} (+{ag.within_15m_count * 5})
                               </span>
                             )}
                             {(ag.exempt_count || 0) > 0 && (
@@ -1777,25 +1806,15 @@ export default function ReportsPage() {
                                 🛡️معفي: {ag.exempt_count}
                               </span>
                             )}
-                            {(ag.delay_15_30_count || 0) > 0 && (
-                              <span style={{ padding: '1px 5px', borderRadius: 4, background: C.yellowBg, color: C.yellowLight, fontWeight: 700 }} title="تأخير 15 إلى 30 دقيقة (-1 نقطة لكل شات)">
-                                🟡15-30د: {ag.delay_15_30_count} (-{ag.delay_15_30_count})
-                              </span>
-                            )}
-                            {(ag.delay_30_45_count || 0) > 0 && (
-                              <span style={{ padding: '1px 5px', borderRadius: 4, background: 'rgba(251,146,60,0.15)', color: '#fb923c', fontWeight: 700 }} title="تأخير 30 إلى 45 دقيقة (-2 نقطة لكل شات)">
-                                🟠30-45د: {ag.delay_30_45_count} (-{ag.delay_30_45_count * 2})
-                              </span>
-                            )}
-                            {(ag.delay_over_45_count || 0) > 0 && (
-                              <span style={{ padding: '1px 5px', borderRadius: 4, background: C.redBg, color: C.redLight, fontWeight: 700 }} title="تأخير أكثر من 45 دقيقة (-3 نقاط لكل شات)">
-                                🔴+45د: {ag.delay_over_45_count} (-{ag.delay_over_45_count * 3})
+                            {totalLateOver15 > 0 && (
+                              <span style={{ padding: '1px 5px', borderRadius: 4, background: C.redBg, color: C.redLight, fontWeight: 700 }} title="تأخير حرج أكثر من 15 دقيقة بدون رد (0 نقاط لكل شات)">
+                                🔴+15د: {totalLateOver15} (0 نقطة)
                               </span>
                             )}
                           </div>
                         </td>
 
-                        {/* Shift Status */}
+                        {/* Shift Status & 30m/Daily Capacity */}
                         <td style={{ padding: '12px 16px', textAlign: 'center' }}>
                           {ag.in_grace_period ? (
                             <span style={{
@@ -1830,6 +1849,28 @@ export default function ReportsPage() {
                             }}>
                               ⚪ خارج الشيفت
                             </span>
+                          )}
+                          {ag.is_mapped_sales && (
+                            <div style={{ marginTop: 5, fontSize: 10, color: C.textMuted, display: 'flex', justifyContent: 'center', gap: 6, flexWrap: 'wrap' }}>
+                              <span style={{
+                                padding: '1px 6px',
+                                borderRadius: 4,
+                                background: (ag.current_window_chats || 0) >= (ag.chat_limit || 10) ? C.redBg : 'rgba(255,255,255,0.05)',
+                                color: (ag.current_window_chats || 0) >= (ag.chat_limit || 10) ? C.redLight : C.textBright,
+                                fontWeight: 700
+                              }} title="سقف آخر 30 دقيقة متحركة (Rolling 30m Window)">
+                                ⏱️ 30د: {ag.current_window_chats || 0}/{ag.chat_limit || 10}
+                              </span>
+                              <span style={{
+                                padding: '1px 6px',
+                                borderRadius: 4,
+                                background: (ag.today_chats_count || 0) >= (ag.daily_chat_limit || 100) ? C.redBg : 'rgba(255,255,255,0.05)',
+                                color: (ag.today_chats_count || 0) >= (ag.daily_chat_limit || 100) ? C.redLight : C.textDim,
+                                fontWeight: 600
+                              }} title="سقف شاتات اليوم كامل">
+                                📅 اليوم: {ag.today_chats_count || 0}/{ag.daily_chat_limit || 100}
+                              </span>
+                            </div>
                           )}
                         </td>
 

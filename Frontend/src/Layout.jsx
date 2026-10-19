@@ -1,14 +1,35 @@
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 import { NavLink, Outlet } from 'react-router-dom';
-import { authStorage, authApi } from './api/agents';
+import { authStorage, authApi, agentsApi } from './api/agents';
 import { useTheme } from './context/ThemeContext';
 
 export default function Layout() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [uploadingSheet, setUploadingSheet] = useState(false);
+  const [uploadMsg, setUploadMsg] = useState(null);
+  const fileInputRef = useRef(null);
   const { theme, toggleTheme } = useTheme();
 
   const toggleSidebar = () => setSidebarOpen(!sidebarOpen);
   const closeSidebar = () => setSidebarOpen(false);
+
+  const handleSheetUpload = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploadingSheet(true);
+    setUploadMsg(null);
+    try {
+      const res = await agentsApi.uploadCloudSheet(file);
+      setUploadMsg(res.message || 'تم تحديث قاعدة البيانات السحابية بنجاح');
+      setTimeout(() => setUploadMsg(null), 5000);
+    } catch (err) {
+      setUploadMsg(`❌ ${err.message || 'فشل رفع الملف'}`);
+      setTimeout(() => setUploadMsg(null), 5000);
+    } finally {
+      setUploadingSheet(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
 
   return (
     <>
@@ -62,9 +83,47 @@ export default function Layout() {
           borderTop: '1px solid var(--border-subtle)',
           display: 'flex',
           flexDirection: 'column',
-          gap: 12,
+          gap: 10,
           background: 'var(--bg-surface-elevated)'
         }}>
+          {/* Cloud Sheet Upload (Excel/CSV -> HF Dataset) */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".xlsx,.xls,.csv"
+            style={{ display: 'none' }}
+            onChange={handleSheetUpload}
+          />
+          <button
+            type="button"
+            disabled={uploadingSheet}
+            onClick={() => fileInputRef.current?.click()}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 6,
+              padding: '8px 12px',
+              background: 'var(--primary-bg)',
+              border: '1px solid var(--primary-border)',
+              borderRadius: 8,
+              color: 'var(--primary)',
+              fontSize: 12,
+              fontWeight: 700,
+              cursor: uploadingSheet ? 'not-allowed' : 'pointer',
+              transition: 'all 0.2s'
+            }}
+            title="رفع شيت إكسيل أو CSV وتحديث قاعدة البيانات السحابية مباشرة"
+          >
+            <span>{uploadingSheet ? '⏳' : '☁️'}</span>
+            <span>{uploadingSheet ? 'جاري الرفع للسحابة...' : 'رفع شيت للسحابة (Excel/CSV)'}</span>
+          </button>
+          {uploadMsg && (
+            <div style={{ fontSize: 11, color: 'var(--badge-ready-text)', fontWeight: 700, textAlign: 'center' }}>
+              {uploadMsg}
+            </div>
+          )}
+
           {/* Quick Theme Toggle Button */}
           <button
             type="button"

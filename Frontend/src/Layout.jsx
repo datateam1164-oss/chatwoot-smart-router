@@ -47,7 +47,10 @@ export default function Layout() {
       {/* ─── Sidebar ─── */}
       <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`}>
         <div className="sidebar-logo">
-          <h2 style={{ fontSize: 18, color: 'var(--text-main)', fontWeight: 800 }}>⚡ نظام التوزيع</h2>
+          <h2 style={{ fontSize: 18, color: 'var(--text-main)', fontWeight: 800, display: 'flex', alignItems: 'center', gap: 8 }}>
+            <img src="./favicon.svg?v=2" alt="Routing" style={{ width: 24, height: 24, borderRadius: 6, flexShrink: 0 }} />
+            <span>نظام التوزيع</span>
+          </h2>
         </div>
         
         <nav className="sidebar-nav">

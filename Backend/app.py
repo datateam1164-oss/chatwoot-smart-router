@@ -18,6 +18,7 @@ from flask_cors import CORS
 
 import database
 import crm_service
+import hf_sync
 
 # Patch requests.Session to always have a timeout
 _orig_request = requests.Session.request
@@ -546,14 +547,23 @@ def set_routing_enabled(enabled: bool):
         routing_wake_event.set()
 
 def _periodic_routing_loop():
-    logger.info("🔄 Periodic Routing Engine thread started (Default: Standby/Paused)...")
+    logger.info("🔄 Periodic Routing Engine + Hugging Face Cloud Sync thread started...")
     last_smart_reassign_ts = 0
+    last_cloud_push_ts = 0
     while True:
+        needs_cloud_push = False
+        try:
+            if hf_sync.poll_and_apply_cloud_ui_changes(sys.modules[__name__]):
+                needs_cloud_push = True
+        except Exception as e:
+            logger.error(f"❌ Cloud UI poll error: {e}")
+
         try:
             if is_routing_enabled():
                 routed = _run_single_routing_loop_safe()
                 if routed > 0:
                     logger.info(f"✅ Auto-Cycle Finished: Routed {routed} conversations.")
+                    needs_cloud_push = True
         except Exception as e:
             logger.error(f"❌ Periodic routing error: {e}")
 
@@ -564,13 +574,21 @@ def _periodic_routing_loop():
                 res = _execute_smart_reassign()
                 if res.get("reassigned_count", 0) > 0:
                     logger.info(f"⚡ Auto Smart-Reassign Finished: Reassigned {res['reassigned_count']} delayed conversations.")
+                    needs_cloud_push = True
             elif not cfg.get("auto_enabled"):
                 last_smart_reassign_ts = 0
         except Exception as e:
             logger.error(f"❌ Periodic smart reassign error: {e}")
 
+        try:
+            if needs_cloud_push or (time.time() - last_cloud_push_ts >= 120):
+                last_cloud_push_ts = time.time()
+                hf_sync.export_and_push_to_cloud(sys.modules[__name__], num_pages=8)
+        except Exception as e:
+            logger.error(f"❌ Periodic cloud push error: {e}")
+
         settings = database.get_settings()
-        interval = int(settings.get("periodic_interval", 60))
+        interval = int(settings.get("periodic_interval", 45))
         # Wait for interval or instant wake-up event
         routing_wake_event.wait(timeout=interval)
         routing_wake_event.clear()
@@ -3660,13 +3678,20 @@ def _enforce_single_instance():
         print("="*70 + "\n")
         sys.exit(1)
 
-if __name__ == '__main__':
-    _enforce_single_instance()
-    logger.info("🚀 Initializing Chatwoot Smart Router...")
+_engine_bootstrapped = False
+
+def bootstrap_engine(start_threads: bool = True):
+    global _engine_bootstrapped
+    if _engine_bootstrapped:
+        return
+    _engine_bootstrapped = True
+
+    logger.info("🚀 Initializing Chatwoot Smart Router & Cloud Sync...")
     database.init_db()
-    # Safety: Start with routing STOPPED until supervisor clicks Start in Dashboard
-    set_routing_enabled(False)
-    
+
+    # Restore persistent cloud state from Hugging Face Dataset (ar7222/chatwoot-smart-router-db)
+    hf_sync.restore_database_from_cloud(sys.modules[__name__])
+
     # 1. Load initial agents and teams from Chatwoot
     _refresh_team_cache()
     sync_chatwoot_agents_to_db()
@@ -3679,14 +3704,19 @@ if __name__ == '__main__':
     except Exception as e:
         logger.warning(f"⚠️ Initial CRM sync skipped: {e}")
 
-    # 3. Start periodic routing loop in background
-    periodic_thread = threading.Thread(target=_periodic_routing_loop, daemon=True, name="PeriodicRouter")
-    periodic_thread.start()
+    if start_threads:
+        periodic_thread = threading.Thread(target=_periodic_routing_loop, daemon=True, name="PeriodicRouter")
+        periodic_thread.start()
 
-    # 4. Start periodic Chatwoot report counts updater in background
-    report_thread = threading.Thread(target=_periodic_agent_report_updater, daemon=True, name="CWReportUpdater")
-    report_thread.start()
+        report_thread = threading.Thread(target=_periodic_agent_report_updater, daemon=True, name="CWReportUpdater")
+        report_thread.start()
 
+if os.environ.get('RENDER') or os.environ.get('GUNICORN_CMD_ARGS') or os.environ.get('AUTO_BOOTSTRAP') == '1':
+    bootstrap_engine(start_threads=True)
+
+if __name__ == '__main__':
+    _enforce_single_instance()
+    bootstrap_engine(start_threads=True)
     port = int(os.environ.get('PORT', 5005))
     logger.info(f"🌐 Chatwoot Routing Engine is LIVE on port {port}.")
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)

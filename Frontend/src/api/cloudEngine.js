@@ -132,8 +132,13 @@ export async function loadCloudDatabase(forceRefresh = false) {
   };
 }
 
-export async function saveCloudDatabase(dbData, summaryMessage = 'Update cloud database') {
+export async function saveCloudDatabase(dbData, summaryMessage = 'Update cloud database', pendingCommand = null) {
   dbData.updated_at = new Date().toISOString();
+  dbData.ui_updated_at = Date.now();
+  if (pendingCommand) {
+    const existingCmds = Array.isArray(dbData.pending_commands) ? dbData.pending_commands : [];
+    dbData.pending_commands = [...existingCmds, { ...pendingCommand, ts: Date.now() }];
+  }
   _cloudCache = dbData;
   _cloudCacheTs = Date.now();
 
@@ -657,7 +662,10 @@ export async function handleCloudApi(endpoint, options = {}) {
     const before = (rep.pending_chats || []).length;
     rep.pending_chats = (rep.pending_chats || []).filter(c => String(c.agent_id) !== String(aid));
     const pulled = before - rep.pending_chats.length;
-    await saveCloudDatabase(db, `Pull chats from agent #${aid}`);
+    await saveCloudDatabase(db, `Pull chats from agent #${aid}`, {
+      action: 'pull_agent_chats',
+      payload: { agent_id: aid }
+    });
     return { success: true, pulled_count: pulled };
   }
 
@@ -723,7 +731,11 @@ export async function handleCloudApi(endpoint, options = {}) {
   }
 
   if (pathOnly === '/routing/run-cycle' && method === 'POST') {
-    return { success: true, routed_count: 0 };
+    await saveCloudDatabase(db, 'Trigger manual routing cycle', {
+      action: 'run_cycle',
+      payload: {}
+    });
+    return { success: true, routed_count: 0, message: 'تم إرسال أمر دورة التوزيع لمحرك السحابة' };
   }
 
   if (pathOnly === '/routing/toggle-unlabeled' && method === 'POST') {
@@ -781,9 +793,10 @@ export async function handleCloudApi(endpoint, options = {}) {
 
   if (pathOnly === '/reports/smart-reassign/execute' && method === 'POST') {
     const result = executeCloudSmartReassign(db, body);
-    if (result.success && result.reassigned_count > 0) {
-      await saveCloudDatabase(db, `Smart reassign ${result.reassigned_count} delayed chats`);
-    }
+    await saveCloudDatabase(db, `Smart reassign ${result.reassigned_count || 0} delayed chats`, {
+      action: 'smart_reassign',
+      payload: body
+    });
     return result;
   }
 
@@ -792,7 +805,10 @@ export async function handleCloudApi(endpoint, options = {}) {
     const cid = unassignConvMatch[1];
     if (db.delays_report && Array.isArray(db.delays_report.pending_chats)) {
       db.delays_report.pending_chats = db.delays_report.pending_chats.filter(c => String(c.conv_id) !== String(cid));
-      await saveCloudDatabase(db, `Unassign conversation #${cid}`);
+      await saveCloudDatabase(db, `Unassign conversation #${cid}`, {
+        action: 'unassign_conv',
+        payload: { conv_id: cid, agent_id: body?.agent_id }
+      });
     }
     return { success: true };
   }
@@ -807,6 +823,10 @@ export async function handleCloudApi(endpoint, options = {}) {
   }
 
   if (pathOnly === '/crm/sync' && method === 'POST') {
+    await saveCloudDatabase(db, 'Trigger CRM shift sync', {
+      action: 'crm_sync',
+      payload: {}
+    });
     return { success: true, synced_count: (db.agents || []).filter(a => a.crm_name).length };
   }
 

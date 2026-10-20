@@ -1,11 +1,13 @@
 services:
   - type: web
-    name: chatwoot-smart-router
-    runtime: python
-    buildCommand: pip install -r Backend/requirements.txt
-    startCommand: python Backend/app.py
+    name: chatwoot-smart-router-engine
+    env: python
+    plan: free
+    rootDir: Backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.12.0
-      - key: PYTHONUTF8
+      - key: AUTO_BOOTSTRAP
         value: "1"
+      - key: PYTHON_VERSION
+        value: "3.11.8"

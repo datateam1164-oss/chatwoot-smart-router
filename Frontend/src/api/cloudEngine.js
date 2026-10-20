@@ -475,10 +475,14 @@ function executeCloudSmartReassign(db, payload = {}) {
       oldSummary.pulled_today_count = Number(oldSummary.pulled_today_count || 0) + 1;
     }
 
+    const chatUrl = chat.chatwoot_url || `https://crm.elkheta.com/app/accounts/1/conversations/${chat.conv_id}`;
     chat.reassigned_from = {
       from_agent_name: chat.agent_name,
       to_agent_name: best.name,
+      to_agent_score: bestScore,
+      to_agent_window_chats: `${best.current_window_chats}/${best.chat_limit || 10}`,
       delay_minutes: chat.delay_minutes,
+      chatwoot_url: chatUrl,
       timestamp: nowStr
     };
     chat.agent_id = String(best.id);
@@ -491,8 +495,11 @@ function executeCloudSmartReassign(db, payload = {}) {
 
     transfers.push({
       conv_id: chat.conv_id,
+      chatwoot_url: chatUrl,
       label: matchedLabel,
       customer_name: chat.customer_name || '',
+      customer_phone: chat.customer_phone || '',
+      last_message: chat.last_message || '',
       from_agent_id: oldAid,
       from_agent_name: chat.reassigned_from.from_agent_name,
       to_agent_id: String(best.id),

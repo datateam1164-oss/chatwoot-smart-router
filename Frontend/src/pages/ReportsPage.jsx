@@ -24,6 +24,14 @@ export default function ReportsPage() {
   const [pullModalChat, setPullModalChat] = useState(null);
   const [pullingChat, setPullingChat] = useState(false);
 
+  // Full Agents list for live target prediction ("هيروح لمين") + Eye Inspector Modal State
+  const [allAgents, setAllAgents] = useState([]);
+  const [inspectorModalOpen, setInspectorModalOpen] = useState(false);
+  const [inspectorTab, setInspectorTab] = useState('candidates'); // 'candidates' | 'history'
+  const [inspectorLabelFilter, setInspectorLabelFilter] = useState('all');
+  const [inspectorSelectedChat, setInspectorSelectedChat] = useState(null);
+  const [copiedUrlId, setCopiedUrlId] = useState(null);
+
   // Smart Delayed Reassignment State (سحب وإعادة توزيع المتأخرات للأعلى سكور والأقل شاتات)
   const [reassignConfig, setReassignConfig] = useState({
     labels: [],
@@ -48,7 +56,13 @@ export default function ReportsPage() {
     if (isManualRefresh) setRefreshing(true);
     setError(null);
     try {
-      const data = await agentsApi.fetchDelaysReport(isManualRefresh, scanPages);
+      const [data, agentsList] = await Promise.all([
+        agentsApi.fetchDelaysReport(isManualRefresh, scanPages),
+        agentsApi.fetchAgents().catch(() => [])
+      ]);
+      if (Array.isArray(agentsList)) {
+        setAllAgents(agentsList);
+      }
       if (data && data.success) {
         setReport(data);
         if (data.smart_reassign_config && !reassignConfigLoaded) {
@@ -148,6 +162,102 @@ export default function ReportsPage() {
       return cLabels.some(l => selectedSet.has(String(l).trim().toLowerCase()));
     });
   }, [report, reassignConfig.labels, reassignConfig.min_delay_minutes]);
+
+  // Live Predictor: For any delayed chat, calculate which agent it WILL go to ("هيروح لمين")
+  const predictTargetAgentForChat = useCallback((chat) => {
+    if (!chat) return null;
+    const summaryMap = new Map(
+      (report?.agents_summary || []).map(a => [String(a.agent_id), a])
+    );
+    const cLabels = (chat.labels || []).map(l => String(l || '').trim()).filter(Boolean);
+    const matchedLabel = cLabels[0] || 'unlabeled';
+    const matchedLower = matchedLabel.toLowerCase();
+    const oldAid = String(chat.agent_id || '');
+
+    const eligiblePool = (allAgents || []).filter(a => {
+      if (String(a.id) === oldAid) return false;
+      if (a.is_paused || !a.in_shift || a.in_grace_period) return false;
+      const aLabels = (a.assigned_labels || []).map(x => String(x || '').trim().toLowerCase()).filter(Boolean);
+      if (matchedLower !== 'unlabeled' && aLabels.length > 0 && !aLabels.includes(matchedLower)) {
+        return false;
+      }
+      const winCount = Number(a.current_window_chats || 0);
+      const winLim = Number(a.chat_limit || 10);
+      if (winCount >= winLim) return false;
+      const dayCount = Number(a.today_chats_count || 0);
+      const dayLim = Number(a.daily_chat_limit || 100);
+      if (dayCount >= dayLim) return false;
+      return true;
+    });
+
+    eligiblePool.sort((a, b) => {
+      const scA = Number(summaryMap.get(String(a.id))?.speed_score || 0);
+      const scB = Number(summaryMap.get(String(b.id))?.speed_score || 0);
+      if (scB !== scA) return scB - scA;
+      const wA = Number(a.current_window_chats || 0);
+      const wB = Number(b.current_window_chats || 0);
+      if (wA !== wB) return wA - wB;
+      return Number(a.today_chats_count || 0) - Number(b.today_chats_count || 0);
+    });
+
+    const best = eligiblePool[0] || null;
+    const bestScore = best ? Number(summaryMap.get(String(best.id))?.speed_score || 0) : 0;
+
+    return {
+      matchedLabel,
+      eligibleCount: eligiblePool.length,
+      bestAgent: best,
+      bestScore,
+      windowText: best ? `${best.current_window_chats || 0}/${best.chat_limit || 10}` : '—',
+      dailyText: best ? `${best.today_chats_count || 0}/${best.daily_chat_limit || 100}` : '—',
+      runnerUpAgent: eligiblePool[1] || null
+    };
+  }, [allAgents, report]);
+
+  const handleCopyChatUrl = (convId, url) => {
+    const cleanUrl = url || `https://crm.elkheta.com/app/accounts/1/conversations/${convId}`;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(cleanUrl).catch(() => {});
+    }
+    setCopiedUrlId(String(convId));
+    showNotification(`🔗 تم نسخ لينك المحادثة #${convId} بنجاح`, 'success');
+    setTimeout(() => setCopiedUrlId(null), 2500);
+  };
+
+  const openInspectorModal = ({ tab = 'candidates', labelFilter = 'all', spotlightChat = null } = {}) => {
+    setInspectorTab(tab);
+    setInspectorLabelFilter(labelFilter);
+    setInspectorSelectedChat(spotlightChat);
+    setInspectorModalOpen(true);
+  };
+
+  // Filtered candidates inside the Eye Inspector Modal
+  const inspectorCandidatesList = useMemo(() => {
+    const pending = report?.pending_chats || [];
+    const minDelay = Number(reassignConfig.min_delay_minutes || 15);
+    const selectedSet = new Set((reassignConfig.labels || []).map(l => String(l).trim().toLowerCase()));
+
+    return pending.filter(ch => {
+      if (Number(ch.delay_minutes || 0) < minDelay) return false;
+      const cLabels = Array.isArray(ch.labels) ? ch.labels.filter(Boolean) : [];
+      if (inspectorLabelFilter !== 'all') {
+        return cLabels.some(l => String(l).trim().toLowerCase() === String(inspectorLabelFilter).trim().toLowerCase());
+      }
+      if (selectedSet.size > 0) {
+        if (cLabels.length === 0) {
+          return selectedSet.has('unlabeled') || selectedSet.has('بدون ليبل') || selectedSet.has('بدون ليبل (unlabeled)');
+        }
+        return cLabels.some(l => selectedSet.has(String(l).trim().toLowerCase()));
+      }
+      return true;
+    });
+  }, [report, reassignConfig.min_delay_minutes, reassignConfig.labels, inspectorLabelFilter]);
+
+  const inspectorHistoryList = useMemo(() => {
+    const list = Array.isArray(reassignHistory) ? reassignHistory : [];
+    if (inspectorLabelFilter === 'all') return list;
+    return list.filter(item => String(item.label || '').trim().toLowerCase() === String(inspectorLabelFilter).trim().toLowerCase());
+  }, [reassignHistory, inspectorLabelFilter]);
 
   const handleTogglePullableLabel = (lbl) => {
     setReassignConfig(prev => {
@@ -816,6 +926,36 @@ export default function ReportsPage() {
               </span>
             </button>
 
+            {/* Eye Inspector Button: Preview Chats That Will Be Pulled & Already Pulled */}
+            <button
+              onClick={() => openInspectorModal({
+                tab: matchingPullableChats.length > 0 ? 'candidates' : (reassignHistory.length > 0 ? 'history' : 'candidates'),
+                labelFilter: 'all',
+                spotlightChat: null
+              })}
+              className="btn"
+              style={{
+                background: 'linear-gradient(135deg, rgba(168,85,247,0.22), rgba(56,189,248,0.22))',
+                color: '#f8fafc',
+                border: '1px solid rgba(168,85,247,0.55)',
+                fontWeight: 800,
+                fontSize: 12,
+                padding: '9px 14px',
+                borderRadius: 10,
+                cursor: 'pointer',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 6,
+                boxShadow: '0 4px 14px rgba(168,85,247,0.18)'
+              }}
+              title="معاينة الشاتات المرشحة للسحب الآن (يتسحب من مين وهيروح لمين + اللينك) وسجل الشاتات التي تم سحبها"
+            >
+              <span style={{ fontSize: 15 }}>👁️</span>
+              <span>
+                معاينة السحب ({matchingPullableChats.length} هيتسحب | {reassignHistory.length} اتسحب)
+              </span>
+            </button>
+
             <button
               onClick={() => handleSaveSmartReassignConfig()}
               disabled={savingReassignConfig}
@@ -869,7 +1009,7 @@ export default function ReportsPage() {
                 🏷️ ليبلات السيلز فقط — اختر منها الليبلات المطلوب سحبها عند التأخير:
               </span>
               <span style={{ fontSize: 11, color: C.textDim }}>
-                (محدد للسحب: <strong style={{ color: C.accent }}>{reassignConfig.labels.length}</strong> من {availableLabelsForReassign.length} ليبل سيلز — أي ليبل غير محدد هنا يُترك مع موظفه)
+                (محدد للسحب: <strong style={{ color: C.accent }}>{reassignConfig.labels.length}</strong> من {availableLabelsForReassign.length} ليبل سيلز — اضغط على 👁️ بجانب أي ليبل لمعاينة الشاتات اللي هتتسحب فيه)
               </span>
             </div>
 
@@ -914,44 +1054,73 @@ export default function ReportsPage() {
               );
               const title = item.displayTitle || item.label;
               return (
-                <button
+                <div
                   key={item.label}
-                  onClick={() => handleTogglePullableLabel(item.label)}
                   style={{
-                    padding: '6px 12px',
-                    borderRadius: 9,
-                    fontSize: 12,
-                    fontWeight: isSelected ? 800 : 600,
-                    cursor: 'pointer',
-                    background: isSelected
-                      ? 'rgba(16,185,129,0.2)'
-                      : C.bgLighter,
-                    color: isSelected ? C.greenLight : C.textMuted,
-                    border: isSelected
-                      ? '1px solid rgba(16,185,129,0.55)'
-                      : `1px solid ${C.border}`,
                     display: 'inline-flex',
                     alignItems: 'center',
-                    gap: 6,
+                    borderRadius: 9,
+                    background: isSelected ? 'rgba(16,185,129,0.2)' : C.bgLighter,
+                    border: isSelected ? '1px solid rgba(16,185,129,0.55)' : `1px solid ${C.border}`,
+                    overflow: 'hidden',
                     transition: 'all 0.15s ease'
                   }}
-                  title={isSelected ? 'مُفعّل للسحب عند التأخير (اضغط للإلغاء)' : 'غير مفعّل للسحب — سيتم ترك شاتات هذا الليبل مع الموظف (اضغط للتفعيل)'}
                 >
-                  <span>{isSelected ? '✅' : '⬜'}</span>
-                  <span>{title}</span>
+                  <button
+                    onClick={() => handleTogglePullableLabel(item.label)}
+                    style={{
+                      padding: '6px 10px',
+                      fontSize: 12,
+                      fontWeight: isSelected ? 800 : 600,
+                      cursor: 'pointer',
+                      background: 'transparent',
+                      color: isSelected ? C.greenLight : C.textMuted,
+                      border: 'none',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 6
+                    }}
+                    title={isSelected ? 'مُفعّل للسحب عند التأخير (اضغط للإلغاء)' : 'غير مفعّل للسحب — سيتم ترك شاتات هذا الليبل مع الموظف (اضغط للتفعيل)'}
+                  >
+                    <span>{isSelected ? '✅' : '⬜'}</span>
+                    <span>{title}</span>
+                    {item.delayedCount > 0 && (
+                      <span style={{
+                        background: isSelected ? 'rgba(239,68,68,0.85)' : 'rgba(239,68,68,0.22)',
+                        color: isSelected ? '#fff' : C.redLight,
+                        padding: '1px 6px',
+                        borderRadius: 10,
+                        fontSize: 10,
+                        fontWeight: 800
+                      }}>
+                        {item.delayedCount} متأخر
+                      </span>
+                    )}
+                  </button>
                   {item.delayedCount > 0 && (
-                    <span style={{
-                      background: isSelected ? 'rgba(239,68,68,0.85)' : 'rgba(239,68,68,0.22)',
-                      color: isSelected ? '#fff' : C.redLight,
-                      padding: '1px 6px',
-                      borderRadius: 10,
-                      fontSize: 10,
-                      fontWeight: 800
-                    }}>
-                      {item.delayedCount} متأخر
-                    </span>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        openInspectorModal({ tab: 'candidates', labelFilter: item.label, spotlightChat: null });
+                      }}
+                      style={{
+                        padding: '6px 8px',
+                        background: 'rgba(168,85,247,0.22)',
+                        color: '#e9d5ff',
+                        border: 'none',
+                        borderRight: `1px solid ${C.border}`,
+                        cursor: 'pointer',
+                        fontSize: 12,
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        justifyContent: 'center'
+                      }}
+                      title={`👁️ اضغط لمعاينة الـ ${item.delayedCount} شات المتأخرة في ليبل (${title}): هيتسحبوا من مين وهيروحوا لمين + اللينك`}
+                    >
+                      👁️
+                    </button>
                   )}
-                </button>
+                </div>
               );
             })}
           </div>
@@ -1020,50 +1189,101 @@ export default function ReportsPage() {
             borderRadius: 12,
             padding: '12px 14px',
             border: '1px solid rgba(168,85,247,0.35)',
-            maxHeight: 220,
+            maxHeight: 240,
             overflowY: 'auto'
           }}>
-            <div style={{ fontSize: 12, fontWeight: 800, color: C.purple, marginBottom: 8 }}>
-              📜 آخر التحويلات الذكية المنفذة (بعد الفحص اللحظي ⬅️ للأعلى سكور ضمن سقف الـ 30 دقيقة):
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+              <div style={{ fontSize: 12, fontWeight: 800, color: C.purple }}>
+                📜 آخر التحويلات الذكية المنفذة (بعد الفحص اللحظي ⬅️ للأعلى سكور ضمن سقف الـ 30 دقيقة):
+              </div>
+              <button
+                onClick={() => openInspectorModal({ tab: 'history', labelFilter: 'all', spotlightChat: null })}
+                style={{
+                  fontSize: 11,
+                  padding: '3px 10px',
+                  borderRadius: 7,
+                  background: 'rgba(168,85,247,0.2)',
+                  color: '#e9d5ff',
+                  border: '1px solid rgba(168,85,247,0.45)',
+                  fontWeight: 700,
+                  cursor: 'pointer'
+                }}
+              >
+                👁️ عرض السجل الكامل باللينكات
+              </button>
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-              {reassignHistory.map((item, idx) => (
-                <div
-                  key={`${item.conv_id}-${idx}`}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'space-between',
-                    flexWrap: 'wrap',
-                    gap: 8,
-                    fontSize: 12,
-                    padding: '6px 10px',
-                    borderRadius: 8,
-                    background: C.bgLighter,
-                    border: `1px solid ${C.borderLight}`
-                  }}
-                >
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                    <strong style={{ color: C.accent }}>#{item.conv_id}</strong>
-                    <span style={{
-                      fontSize: 10,
-                      padding: '1px 6px',
-                      borderRadius: 6,
-                      background: 'rgba(56,189,248,0.12)',
-                      color: C.accent
-                    }}>
-                      🏷️ {item.label}
-                    </span>
-                    <span style={{ color: C.textDim }}>تأخير: {item.delay_minutes} د</span>
-                    <span style={{ color: C.redLight }}>من: <strong>{item.from_agent_name}</strong> (0 نقطة)</span>
-                    <span>⬅️</span>
-                    <span style={{ color: C.greenLight }}>
-                      إلى: <strong>{item.to_agent_name}</strong> (السكور: +{item.to_agent_score} | الـ30د: {item.to_agent_window_chats || item.to_agent_open_chats})
-                    </span>
+              {reassignHistory.map((item, idx) => {
+                const itemUrl = item.chatwoot_url || `https://crm.elkheta.com/app/accounts/1/conversations/${item.conv_id}`;
+                return (
+                  <div
+                    key={`${item.conv_id}-${idx}`}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      flexWrap: 'wrap',
+                      gap: 8,
+                      fontSize: 12,
+                      padding: '7px 10px',
+                      borderRadius: 8,
+                      background: C.bgLighter,
+                      border: `1px solid ${C.borderLight}`
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                      <a
+                        href={itemUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        style={{ color: C.accent, fontWeight: 800, textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: 3 }}
+                        title="فتح المحادثة مباشرة في Chatwoot"
+                      >
+                        <span>#{item.conv_id}</span>
+                        <span style={{ fontSize: 10 }}>↗</span>
+                      </a>
+                      <span style={{
+                        fontSize: 10,
+                        padding: '1px 6px',
+                        borderRadius: 6,
+                        background: 'rgba(56,189,248,0.12)',
+                        color: C.accent
+                      }}>
+                        🏷️ {item.label}
+                      </span>
+                      <span style={{ color: C.textDim }}>تأخير: {item.delay_minutes} د</span>
+                      <span style={{ color: C.redLight }}>اتسحب من: <strong>{item.from_agent_name}</strong></span>
+                      <span>⬅️</span>
+                      <span style={{ color: C.greenLight }}>
+                        راح لـ: <strong>{item.to_agent_name}</strong> (السكور: +{item.to_agent_score} | الـ30د: {item.to_agent_window_chats || item.to_agent_open_chats})
+                      </span>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <button
+                        onClick={() => openInspectorModal({ tab: 'history', labelFilter: 'all', spotlightChat: { ...item, isHistoryItem: true, chatwoot_url: itemUrl } })}
+                        style={{
+                          padding: '2px 8px',
+                          borderRadius: 6,
+                          background: 'rgba(168,85,247,0.2)',
+                          color: '#e9d5ff',
+                          border: '1px solid rgba(168,85,247,0.45)',
+                          fontSize: 11,
+                          fontWeight: 700,
+                          cursor: 'pointer',
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: 4
+                        }}
+                        title="معاينة تفاصيل ولينك الشات المسحوب"
+                      >
+                        <span>👁️</span>
+                        <span>تفاصيل</span>
+                      </button>
+                      <span style={{ fontSize: 11, color: C.textDim, direction: 'ltr' }}>{item.timestamp}</span>
+                    </div>
                   </div>
-                  <span style={{ fontSize: 11, color: C.textDim, direction: 'ltr' }}>{item.timestamp}</span>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         )}
@@ -1398,18 +1618,44 @@ export default function ReportsPage() {
                             <span style={{ fontSize: 11, opacity: 0.7 }}>↗</span>
                           </a>
                           {chat.reassigned_from && (
-                            <div style={{
-                              marginTop: 4,
-                              fontSize: 10,
-                              padding: '2px 6px',
-                              borderRadius: 5,
-                              background: 'rgba(16,185,129,0.14)',
-                              color: C.greenLight,
-                              border: '1px solid rgba(16,185,129,0.35)',
-                              fontWeight: 700,
-                              display: 'inline-block'
-                            }} title={`تم تحويل هذا الشات من ${chat.reassigned_from.from_agent_name} بعد تأخير ${chat.reassigned_from.delay_minutes} د`}>
-                              ⚡ محوّل من {chat.reassigned_from.from_agent_name}
+                            <div
+                              onClick={() => openInspectorModal({
+                                tab: 'history',
+                                labelFilter: 'all',
+                                spotlightChat: {
+                                  conv_id: chat.conv_id,
+                                  chatwoot_url: chat.reassigned_from.chatwoot_url || chat.chatwoot_url,
+                                  label: (chat.labels && chat.labels[0]) || 'unlabeled',
+                                  customer_name: chat.customer_name,
+                                  customer_phone: chat.customer_phone,
+                                  last_message: chat.last_message,
+                                  from_agent_name: chat.reassigned_from.from_agent_name,
+                                  to_agent_name: chat.reassigned_from.to_agent_name || chat.agent_name,
+                                  to_agent_score: chat.reassigned_from.to_agent_score ?? 0,
+                                  to_agent_window_chats: chat.reassigned_from.to_agent_window_chats || '',
+                                  delay_minutes: chat.reassigned_from.delay_minutes,
+                                  timestamp: chat.reassigned_from.timestamp || '',
+                                  isHistoryItem: true
+                                }
+                              })}
+                              style={{
+                                marginTop: 4,
+                                fontSize: 10,
+                                padding: '2px 7px',
+                                borderRadius: 5,
+                                background: 'rgba(16,185,129,0.14)',
+                                color: C.greenLight,
+                                border: '1px solid rgba(16,185,129,0.35)',
+                                fontWeight: 700,
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                gap: 4,
+                                cursor: 'pointer'
+                              }}
+                              title={`اضغط لمعاينة تفاصيل السحب: اتسحب من ${chat.reassigned_from.from_agent_name} وراح لـ ${chat.agent_name} + اللينك`}
+                            >
+                              <span>👁️</span>
+                              <span>⚡ محوّل من {chat.reassigned_from.from_agent_name}</span>
                             </div>
                           )}
                         </td>
@@ -1565,6 +1811,30 @@ export default function ReportsPage() {
                         {/* Supervisor Action Buttons */}
                         <td style={{ padding: '12px 16px', textAlign: 'center', whiteSpace: 'nowrap' }}>
                           <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                            <button
+                              onClick={() => openInspectorModal({
+                                tab: chat.reassigned_from ? 'history' : 'candidates',
+                                labelFilter: 'all',
+                                spotlightChat: chat
+                              })}
+                              className="btn btn-sm"
+                              style={{
+                                background: 'rgba(168,85,247,0.18)',
+                                color: '#e9d5ff',
+                                border: '1px solid rgba(168,85,247,0.45)',
+                                fontSize: 12,
+                                fontWeight: 800,
+                                padding: '4px 8px',
+                                cursor: 'pointer',
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                gap: 4
+                              }}
+                              title="👁️ معاينة تفاصيل الشات واللينك (يتسحب من مين وهيروح لمين / اتسحب من مين وراح لمين)"
+                            >
+                              <span>👁️</span>
+                            </button>
+
                             <button
                               onClick={() => handleSingleSmartReassign(chat)}
                               disabled={reassigningConvId === chat.conv_id}
@@ -2085,6 +2355,768 @@ export default function ReportsPage() {
               >
                 {pullingChat ? 'جاري السحب...' : 'تأكيد السحب الآن'}
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Professional Eye Inspector Modal: Pull & Transfer Route Inspector (👁️ نافذة فحص ومعاينة السحب والتحويل الذكي) ── */}
+      {inspectorModalOpen && (
+        <div
+          onClick={() => setInspectorModalOpen(false)}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(2, 6, 23, 0.82)',
+            backdropFilter: 'blur(8px)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 9999,
+            padding: 16
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="card"
+            style={{
+              maxWidth: 1080,
+              width: '100%',
+              maxHeight: '90vh',
+              display: 'flex',
+              flexDirection: 'column',
+              padding: 0,
+              overflow: 'hidden',
+              border: '1px solid rgba(168,85,247,0.45)',
+              boxShadow: '0 24px 60px rgba(0,0,0,0.65)'
+            }}
+          >
+            {/* Modal Header */}
+            <div style={{
+              padding: '18px 22px',
+              background: 'linear-gradient(135deg, rgba(168,85,247,0.16) 0%, rgba(56,189,248,0.12) 50%, rgba(16,185,129,0.12) 100%)',
+              borderBottom: `1px solid ${C.border}`,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              flexWrap: 'wrap',
+              gap: 12
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                <div style={{
+                  width: 44,
+                  height: 44,
+                  borderRadius: 12,
+                  background: 'rgba(168,85,247,0.22)',
+                  border: '1px solid rgba(168,85,247,0.5)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  fontSize: 22
+                }}>
+                  👁️
+                </div>
+                <div>
+                  <h3 style={{ fontSize: 18, fontWeight: 800, color: C.textBright, margin: 0 }}>
+                    مركز فحص ومعاينة السحب والتحويل الذكي (اللينك + من مين ⬅️ لمين)
+                  </h3>
+                  <div style={{ fontSize: 12, color: C.textMuted, marginTop: 3 }}>
+                    متابعة دقيقة لكل شات مرشح للسحب أو تم سحبه بالفعل مع اللينك المباشر في Chatwoot وتفاصيل الموظف المسحوب منه والمحول إليه
+                  </div>
+                </div>
+              </div>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                {inspectorLabelFilter !== 'all' && (
+                  <button
+                    onClick={() => setInspectorLabelFilter('all')}
+                    style={{
+                      padding: '5px 10px',
+                      borderRadius: 8,
+                      background: 'rgba(56,189,248,0.15)',
+                      color: C.accent,
+                      border: `1px solid ${C.accentBorder}`,
+                      fontSize: 11,
+                      fontWeight: 700,
+                      cursor: 'pointer'
+                    }}
+                  >
+                    🏷️ فلتر الليبل: {inspectorLabelFilter} ✕
+                  </button>
+                )}
+                <button
+                  onClick={() => setInspectorModalOpen(false)}
+                  style={{
+                    width: 34,
+                    height: 34,
+                    borderRadius: 9,
+                    background: 'rgba(255,255,255,0.06)',
+                    color: C.textMuted,
+                    border: `1px solid ${C.border}`,
+                    cursor: 'pointer',
+                    fontSize: 16,
+                    fontWeight: 800
+                  }}
+                  title="إغلاق النافذة"
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+
+            {/* Spotlight Card: When a Specific Chat is Clicked via 👁️ */}
+            {inspectorSelectedChat && (() => {
+              const sc = inspectorSelectedChat;
+              const isAlreadyPulled = Boolean(sc.isHistoryItem || sc.reassigned_from);
+              const chatUrl = sc.chatwoot_url || `https://crm.elkheta.com/app/accounts/1/conversations/${sc.conv_id}`;
+              const prediction = !isAlreadyPulled ? predictTargetAgentForChat(sc) : null;
+
+              const fromAgentName = isAlreadyPulled
+                ? (sc.from_agent_name || sc.reassigned_from?.from_agent_name || sc.agent_name)
+                : sc.agent_name;
+              const toAgentName = isAlreadyPulled
+                ? (sc.to_agent_name || sc.reassigned_from?.to_agent_name || sc.agent_name)
+                : (prediction?.bestAgent?.name || 'لا يوجد موظف متاح حالياً في نفس الليبل');
+              const toAgentScore = isAlreadyPulled
+                ? (sc.to_agent_score ?? sc.reassigned_from?.to_agent_score ?? 0)
+                : (prediction?.bestScore ?? 0);
+              const toAgentWindow = isAlreadyPulled
+                ? (sc.to_agent_window_chats || sc.reassigned_from?.to_agent_window_chats || 'متاح')
+                : (prediction?.windowText || '—');
+              const delayMins = isAlreadyPulled
+                ? (sc.delay_minutes ?? sc.reassigned_from?.delay_minutes ?? 0)
+                : (sc.delay_minutes ?? 0);
+              const chatLabels = Array.isArray(sc.labels) && sc.labels.length > 0
+                ? sc.labels
+                : (sc.label ? [sc.label] : ['unlabeled']);
+
+              return (
+                <div style={{
+                  margin: '16px 22px 0 22px',
+                  padding: '16px 18px',
+                  borderRadius: 14,
+                  background: 'linear-gradient(135deg, rgba(15,23,42,0.95), rgba(30,41,59,0.9))',
+                  border: isAlreadyPulled ? '1px solid rgba(16,185,129,0.5)' : '1px solid rgba(56,189,248,0.5)',
+                  boxShadow: '0 10px 25px rgba(0,0,0,0.35)'
+                }}>
+                  {/* Top Bar: Chat ID + Direct Link + Copy Link */}
+                  <div style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    flexWrap: 'wrap',
+                    gap: 10,
+                    paddingBottom: 12,
+                    marginBottom: 14,
+                    borderBottom: `1px solid ${C.borderLight}`
+                  }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                      <span style={{
+                        padding: '4px 10px',
+                        borderRadius: 8,
+                        background: isAlreadyPulled ? 'rgba(16,185,129,0.2)' : 'rgba(245,158,11,0.2)',
+                        color: isAlreadyPulled ? C.greenLight : C.yellowLight,
+                        border: `1px solid ${isAlreadyPulled ? 'rgba(16,185,129,0.45)' : 'rgba(245,158,11,0.45)'}`,
+                        fontSize: 11,
+                        fontWeight: 800
+                      }}>
+                        {isAlreadyPulled ? '✅ شات تم سحبه وتحويله بالفعل' : '🔮 معاينة شات مرشح للسحب الآن'}
+                      </span>
+                      <strong style={{ fontSize: 16, color: C.textBright }}>
+                        محادثة رقم #{sc.conv_id}
+                      </strong>
+                      {chatLabels.map((lbl, idx) => (
+                        <span key={idx} style={{
+                          fontSize: 11,
+                          padding: '2px 8px',
+                          borderRadius: 6,
+                          background: 'rgba(56,189,248,0.15)',
+                          color: C.accent,
+                          border: `1px solid ${C.accentBorder}`,
+                          fontWeight: 700
+                        }}>
+                          🏷️ {lbl}
+                        </span>
+                      ))}
+                      {sc.customer_name && (
+                        <span style={{ fontSize: 12, color: C.textMuted }}>
+                          👤 العميل: <strong style={{ color: C.textBright }}>{sc.customer_name}</strong>
+                          {sc.customer_phone ? ` (${sc.customer_phone})` : ''}
+                        </span>
+                      )}
+                    </div>
+
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                      <a
+                        href={chatUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        style={{
+                          padding: '6px 14px',
+                          borderRadius: 8,
+                          background: 'linear-gradient(135deg, #0284c7, #0369a1)',
+                          color: '#fff',
+                          fontWeight: 800,
+                          fontSize: 12,
+                          textDecoration: 'none',
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: 6,
+                          boxShadow: '0 4px 12px rgba(2,132,199,0.3)'
+                        }}
+                      >
+                        <span>🔗</span>
+                        <span>فتح الشات في Chatwoot ↗</span>
+                      </a>
+                      <button
+                        onClick={() => handleCopyChatUrl(sc.conv_id, chatUrl)}
+                        style={{
+                          padding: '6px 12px',
+                          borderRadius: 8,
+                          background: copiedUrlId === String(sc.conv_id) ? 'rgba(16,185,129,0.22)' : 'rgba(255,255,255,0.07)',
+                          color: copiedUrlId === String(sc.conv_id) ? C.greenLight : C.textBright,
+                          border: `1px solid ${C.border}`,
+                          fontSize: 12,
+                          fontWeight: 700,
+                          cursor: 'pointer'
+                        }}
+                      >
+                        {copiedUrlId === String(sc.conv_id) ? '✅ تم نسخ اللينك' : '📋 نسخ اللينك'}
+                      </button>
+                      <button
+                        onClick={() => setInspectorSelectedChat(null)}
+                        style={{
+                          padding: '5px 9px',
+                          borderRadius: 8,
+                          background: 'transparent',
+                          color: C.textDim,
+                          border: `1px solid ${C.borderLight}`,
+                          fontSize: 11,
+                          cursor: 'pointer'
+                        }}
+                      >
+                        إخفاء البطاقة ✕
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Direct Clickable URL Bar */}
+                  <div style={{
+                    background: 'rgba(0,0,0,0.28)',
+                    padding: '7px 12px',
+                    borderRadius: 8,
+                    marginBottom: 14,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: 10,
+                    border: `1px solid ${C.borderLight}`,
+                    direction: 'ltr'
+                  }}>
+                    <a
+                      href={chatUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      style={{ color: C.accent, fontSize: 12, fontFamily: 'monospace', textDecoration: 'underline', wordBreak: 'break-all' }}
+                    >
+                      {chatUrl}
+                    </a>
+                    <span style={{ fontSize: 11, color: C.textDim, whiteSpace: 'nowrap' }}>Direct Chatwoot Link</span>
+                  </div>
+
+                  {/* Visual Transfer Flow: From Whom ➔ To Whom */}
+                  <div style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))',
+                    gap: 12,
+                    alignItems: 'stretch'
+                  }}>
+                    {/* Box 1: Pulled From */}
+                    <div style={{
+                      background: 'rgba(239,68,68,0.08)',
+                      border: `1px solid ${C.redBorder}`,
+                      borderRadius: 12,
+                      padding: '12px 14px'
+                    }}>
+                      <div style={{ fontSize: 11, color: C.redLight, fontWeight: 800, marginBottom: 4 }}>
+                        🔴 {isAlreadyPulled ? 'اتسحب من مين (الموظف المتأخر):' : 'يتسحب من مين (الموظف الحالي):'}
+                      </div>
+                      <div style={{ fontSize: 16, fontWeight: 800, color: C.textBright }}>
+                        {fromAgentName || 'غير محدد'}
+                      </div>
+                      <div style={{ fontSize: 12, color: C.textMuted, marginTop: 4 }}>
+                        ⏱️ مدة التأخير بدون رد: <strong style={{ color: C.redLight }}>{delayMins} دقيقة</strong> (0 نقاط)
+                      </div>
+                    </div>
+
+                    {/* Box 2: Pulled To */}
+                    <div style={{
+                      background: 'rgba(16,185,129,0.08)',
+                      border: '1px solid rgba(16,185,129,0.45)',
+                      borderRadius: 12,
+                      padding: '12px 14px'
+                    }}>
+                      <div style={{ fontSize: 11, color: C.greenLight, fontWeight: 800, marginBottom: 4 }}>
+                        🟢 {isAlreadyPulled ? 'راح لمين (الموظف المستلم):' : 'هيروح لمين (الموظف الأعلى سكوراً في نفس الليبل):'}
+                      </div>
+                      <div style={{ fontSize: 16, fontWeight: 800, color: C.greenLight }}>
+                        {toAgentName}
+                      </div>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 6, fontSize: 11, color: C.textBright }}>
+                        <span style={{ background: 'rgba(16,185,129,0.2)', padding: '2px 7px', borderRadius: 6, fontWeight: 700 }}>
+                          🏆 السكور: +{toAgentScore} نقطة
+                        </span>
+                        <span style={{ background: 'rgba(56,189,248,0.16)', padding: '2px 7px', borderRadius: 6, fontWeight: 700 }}>
+                          ⏱️ سعة الـ30د: {toAgentWindow}
+                        </span>
+                        {!isAlreadyPulled && prediction?.bestAgent && (
+                          <span style={{ background: 'rgba(255,255,255,0.07)', padding: '2px 7px', borderRadius: 6 }}>
+                            📅 اليوم: {prediction.dailyText}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Last Message + Instant Pull Button */}
+                  <div style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    flexWrap: 'wrap',
+                    gap: 10,
+                    marginTop: 12,
+                    paddingTop: 10,
+                    borderTop: `1px dashed ${C.borderLight}`
+                  }}>
+                    <div style={{ fontSize: 12, color: C.textMuted, flex: 1 }}>
+                      💬 <strong>آخر رسالة من العميل:</strong> {sc.last_message || '—'}
+                    </div>
+                    {!isAlreadyPulled && (
+                      <button
+                        onClick={() => handleSingleSmartReassign(sc)}
+                        disabled={reassigningConvId === sc.conv_id || !prediction?.bestAgent}
+                        className="btn"
+                        style={{
+                          background: prediction?.bestAgent
+                            ? 'linear-gradient(135deg, #10b981, #059669)'
+                            : 'rgba(255,255,255,0.06)',
+                          color: '#fff',
+                          border: 'none',
+                          padding: '8px 16px',
+                          borderRadius: 9,
+                          fontWeight: 800,
+                          fontSize: 12,
+                          cursor: (reassigningConvId === sc.conv_id || !prediction?.bestAgent) ? 'not-allowed' : 'pointer'
+                        }}
+                      >
+                        {reassigningConvId === sc.conv_id
+                          ? '⏳ جاري الفحص والسحب...'
+                          : `⚡ سحب وتحويل الآن إلى (${prediction?.bestAgent?.name || 'الأعلى سكوراً'})`}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* Tabs Navigation Inside Modal */}
+            <div style={{
+              padding: '14px 22px 10px 22px',
+              borderBottom: `1px solid ${C.borderLight}`,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              flexWrap: 'wrap',
+              gap: 10
+            }}>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <button
+                  onClick={() => setInspectorTab('candidates')}
+                  style={{
+                    padding: '8px 16px',
+                    borderRadius: 10,
+                    fontWeight: 800,
+                    fontSize: 13,
+                    cursor: 'pointer',
+                    background: inspectorTab === 'candidates' ? 'rgba(56,189,248,0.2)' : C.bgLighter,
+                    color: inspectorTab === 'candidates' ? C.accent : C.textMuted,
+                    border: inspectorTab === 'candidates' ? `1px solid ${C.accentBorder}` : `1px solid ${C.border}`,
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 8
+                  }}
+                >
+                  <span>🔮 الشاتات المرشحة للسحب الآن (هيتسحب من مين ⬅️ هيروح لمين)</span>
+                  <span style={{
+                    padding: '1px 8px',
+                    borderRadius: 10,
+                    background: 'rgba(239,68,68,0.25)',
+                    color: C.redLight,
+                    fontSize: 11,
+                    fontWeight: 800
+                  }}>
+                    {inspectorCandidatesList.length}
+                  </span>
+                </button>
+
+                <button
+                  onClick={() => setInspectorTab('history')}
+                  style={{
+                    padding: '8px 16px',
+                    borderRadius: 10,
+                    fontWeight: 800,
+                    fontSize: 13,
+                    cursor: 'pointer',
+                    background: inspectorTab === 'history' ? 'rgba(16,185,129,0.2)' : C.bgLighter,
+                    color: inspectorTab === 'history' ? C.greenLight : C.textMuted,
+                    border: inspectorTab === 'history' ? '1px solid rgba(16,185,129,0.5)' : `1px solid ${C.border}`,
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 8
+                  }}
+                >
+                  <span>📜 الشاتات التي تم سحبها بالفعل (اتسحب من مين ⬅️ راح لمين)</span>
+                  <span style={{
+                    padding: '1px 8px',
+                    borderRadius: 10,
+                    background: 'rgba(16,185,129,0.25)',
+                    color: C.greenLight,
+                    fontSize: 11,
+                    fontWeight: 800
+                  }}>
+                    {inspectorHistoryList.length}
+                  </span>
+                </button>
+              </div>
+
+              {inspectorTab === 'candidates' && inspectorCandidatesList.length > 0 && (
+                <button
+                  onClick={handleExecuteBulkSmartReassign}
+                  disabled={executingReassign || matchingPullableChats.length === 0}
+                  className="btn"
+                  style={{
+                    background: 'linear-gradient(135deg, #0284c7, #0369a1)',
+                    color: '#fff',
+                    border: 'none',
+                    fontWeight: 800,
+                    fontSize: 12,
+                    padding: '8px 14px',
+                    borderRadius: 9,
+                    cursor: (executingReassign || matchingPullableChats.length === 0) ? 'not-allowed' : 'pointer'
+                  }}
+                >
+                  {executingReassign ? '⏳ جاري السحب...' : `🚀 تنفيذ سحب الكل الآن (${matchingPullableChats.length} شات)`}
+                </button>
+              )}
+            </div>
+
+            {/* Modal Table Body */}
+            <div style={{ padding: '14px 22px 22px 22px', overflowY: 'auto', flex: 1 }}>
+              {inspectorTab === 'candidates' ? (
+                inspectorCandidatesList.length === 0 ? (
+                  <div style={{ textAlign: 'center', padding: '45px 20px', color: C.textMuted }}>
+                    <div style={{ fontSize: 34, marginBottom: 8 }}>✨</div>
+                    <div style={{ fontSize: 15, fontWeight: 800, color: C.textBright }}>
+                      لا توجد شاتات مرشحة للسحب حالياً ضمن الفلتر المحدد
+                    </div>
+                    <div style={{ fontSize: 12, color: C.textDim, marginTop: 4 }}>
+                      تأكد من اختيار ليبلات السيلز المطلوبة من الأعلى أو تقليل شرط دقائق التأخير
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{ overflowX: 'auto' }}>
+                    <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'right', fontSize: 12 }}>
+                      <thead>
+                        <tr style={{ background: 'rgba(255,255,255,0.03)', borderBottom: `1px solid ${C.border}`, color: C.textDim }}>
+                          <th style={{ padding: '10px 12px', fontWeight: 800 }}>لينك الشات (Chatwoot)</th>
+                          <th style={{ padding: '10px 12px', fontWeight: 800 }}>العميل والليبل</th>
+                          <th style={{ padding: '10px 12px', fontWeight: 800, color: C.redLight }}>🔴 يتسحب من مين (المتأخر)</th>
+                          <th style={{ padding: '10px 12px', fontWeight: 800, color: C.greenLight }}>🟢 هيروح لمين (الأعلى سكوراً)</th>
+                          <th style={{ padding: '10px 12px', fontWeight: 800, textAlign: 'center' }}>إجراء فوري</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {inspectorCandidatesList.map((chat) => {
+                          const pred = predictTargetAgentForChat(chat);
+                          const chatUrl = chat.chatwoot_url || `https://crm.elkheta.com/app/accounts/1/conversations/${chat.conv_id}`;
+                          return (
+                            <tr
+                              key={chat.conv_id}
+                              style={{
+                                borderBottom: `1px solid ${C.borderLight}`,
+                                background: inspectorSelectedChat?.conv_id === chat.conv_id ? 'rgba(56,189,248,0.08)' : 'transparent'
+                              }}
+                            >
+                              {/* Link Column */}
+                              <td style={{ padding: '10px 12px', whiteSpace: 'nowrap' }}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                                  <a
+                                    href={chatUrl}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    style={{
+                                      padding: '4px 9px',
+                                      borderRadius: 7,
+                                      background: 'rgba(56,189,248,0.15)',
+                                      color: C.accent,
+                                      border: `1px solid ${C.accentBorder}`,
+                                      fontWeight: 800,
+                                      textDecoration: 'none',
+                                      display: 'inline-flex',
+                                      alignItems: 'center',
+                                      gap: 4
+                                    }}
+                                    title="فتح الشات مباشرة في Chatwoot"
+                                  >
+                                    <span>🔗 #{chat.conv_id}</span>
+                                    <span>↗</span>
+                                  </a>
+                                  <button
+                                    onClick={() => handleCopyChatUrl(chat.conv_id, chatUrl)}
+                                    style={{
+                                      padding: '4px 7px',
+                                      borderRadius: 6,
+                                      background: 'rgba(255,255,255,0.06)',
+                                      color: copiedUrlId === String(chat.conv_id) ? C.greenLight : C.textMuted,
+                                      border: `1px solid ${C.border}`,
+                                      cursor: 'pointer',
+                                      fontSize: 11
+                                    }}
+                                    title="نسخ لينك الشات"
+                                  >
+                                    {copiedUrlId === String(chat.conv_id) ? '✅' : '📋'}
+                                  </button>
+                                </div>
+                              </td>
+
+                              {/* Customer & Label */}
+                              <td style={{ padding: '10px 12px' }}>
+                                <div style={{ fontWeight: 700, color: C.textBright }}>{chat.customer_name}</div>
+                                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 3 }}>
+                                  {(chat.labels || []).map((lbl, i) => (
+                                    <span key={i} style={{
+                                      fontSize: 10,
+                                      padding: '1px 6px',
+                                      borderRadius: 5,
+                                      background: 'rgba(56,189,248,0.12)',
+                                      color: C.accent,
+                                      fontWeight: 700
+                                    }}>
+                                      🏷️ {lbl}
+                                    </span>
+                                  ))}
+                                </div>
+                              </td>
+
+                              {/* From Agent */}
+                              <td style={{ padding: '10px 12px' }}>
+                                <div style={{ fontWeight: 800, color: C.redLight }}>{chat.agent_name}</div>
+                                <div style={{ fontSize: 11, color: C.textDim }}>
+                                  ⏳ متأخر منذ <strong style={{ color: C.redLight }}>{chat.delay_minutes} دقيقة</strong>
+                                </div>
+                              </td>
+
+                              {/* Predicted Target Agent */}
+                              <td style={{ padding: '10px 12px' }}>
+                                {pred?.bestAgent ? (
+                                  <div>
+                                    <div style={{ fontWeight: 800, color: C.greenLight }}>
+                                      🎯 {pred.bestAgent.name}
+                                    </div>
+                                    <div style={{ fontSize: 10, color: C.textMuted, marginTop: 2 }}>
+                                      السكور: <strong style={{ color: C.greenLight }}>+{pred.bestScore}</strong> | الـ30د: <strong>{pred.windowText}</strong> | اليوم: {pred.dailyText}
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <span style={{ color: C.yellowLight, fontSize: 11, fontWeight: 700 }}>
+                                    ⚠️ لا يوجد موظف متاح حالياً في نفس الليبل ضمن السقف
+                                  </span>
+                                )}
+                              </td>
+
+                              {/* Actions */}
+                              <td style={{ padding: '10px 12px', textAlign: 'center', whiteSpace: 'nowrap' }}>
+                                <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                                  <button
+                                    onClick={() => setInspectorSelectedChat(chat)}
+                                    style={{
+                                      padding: '4px 8px',
+                                      borderRadius: 6,
+                                      background: 'rgba(168,85,247,0.18)',
+                                      color: '#e9d5ff',
+                                      border: '1px solid rgba(168,85,247,0.45)',
+                                      fontSize: 11,
+                                      fontWeight: 700,
+                                      cursor: 'pointer'
+                                    }}
+                                    title="عرض بطاقة الفحص التفصيلية بالأعلى"
+                                  >
+                                    👁️ فحص
+                                  </button>
+                                  <button
+                                    onClick={() => handleSingleSmartReassign(chat)}
+                                    disabled={reassigningConvId === chat.conv_id || !pred?.bestAgent}
+                                    style={{
+                                      padding: '4px 10px',
+                                      borderRadius: 6,
+                                      background: pred?.bestAgent ? 'rgba(16,185,129,0.2)' : 'rgba(255,255,255,0.05)',
+                                      color: pred?.bestAgent ? C.greenLight : C.textDim,
+                                      border: pred?.bestAgent ? '1px solid rgba(16,185,129,0.5)' : `1px solid ${C.border}`,
+                                      fontSize: 11,
+                                      fontWeight: 800,
+                                      cursor: (reassigningConvId === chat.conv_id || !pred?.bestAgent) ? 'not-allowed' : 'pointer'
+                                    }}
+                                  >
+                                    {reassigningConvId === chat.conv_id ? '⏳...' : '⚡ سحب وتحويل'}
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )
+              ) : (
+                /* Tab 2: Already Pulled History */
+                inspectorHistoryList.length === 0 ? (
+                  <div style={{ textAlign: 'center', padding: '45px 20px', color: C.textMuted }}>
+                    <div style={{ fontSize: 34, marginBottom: 8 }}>📭</div>
+                    <div style={{ fontSize: 15, fontWeight: 800, color: C.textBright }}>
+                      لا توجد شاتات مسحوبة في السجل حتى الآن
+                    </div>
+                    <div style={{ fontSize: 12, color: C.textDim, marginTop: 4 }}>
+                      بجرد سحب أي شات متأخر (تلقائياً أو يدوياً) سيظهر هنا فوراً باللينك وتفاصيل اتسحب من مين وراح لمين
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{ overflowX: 'auto' }}>
+                    <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'right', fontSize: 12 }}>
+                      <thead>
+                        <tr style={{ background: 'rgba(255,255,255,0.03)', borderBottom: `1px solid ${C.border}`, color: C.textDim }}>
+                          <th style={{ padding: '10px 12px', fontWeight: 800 }}>لينك الشات (Chatwoot)</th>
+                          <th style={{ padding: '10px 12px', fontWeight: 800 }}>العميل والليبل</th>
+                          <th style={{ padding: '10px 12px', fontWeight: 800, color: C.redLight }}>🔴 اتسحب من مين</th>
+                          <th style={{ padding: '10px 12px', fontWeight: 800, color: C.greenLight }}>🟢 راح لمين</th>
+                          <th style={{ padding: '10px 12px', fontWeight: 800 }}>وقت التحويل</th>
+                          <th style={{ padding: '10px 12px', fontWeight: 800, textAlign: 'center' }}>معاينة</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {inspectorHistoryList.map((item, idx) => {
+                          const itemUrl = item.chatwoot_url || `https://crm.elkheta.com/app/accounts/1/conversations/${item.conv_id}`;
+                          return (
+                            <tr
+                              key={`${item.conv_id}-${idx}`}
+                              style={{
+                                borderBottom: `1px solid ${C.borderLight}`,
+                                background: inspectorSelectedChat?.conv_id === item.conv_id ? 'rgba(16,185,129,0.08)' : 'transparent'
+                              }}
+                            >
+                              {/* Link */}
+                              <td style={{ padding: '10px 12px', whiteSpace: 'nowrap' }}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                                  <a
+                                    href={itemUrl}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    style={{
+                                      padding: '4px 9px',
+                                      borderRadius: 7,
+                                      background: 'rgba(56,189,248,0.15)',
+                                      color: C.accent,
+                                      border: `1px solid ${C.accentBorder}`,
+                                      fontWeight: 800,
+                                      textDecoration: 'none',
+                                      display: 'inline-flex',
+                                      alignItems: 'center',
+                                      gap: 4
+                                    }}
+                                    title="فتح الشات مباشرة في Chatwoot"
+                                  >
+                                    <span>🔗 #{item.conv_id}</span>
+                                    <span>↗</span>
+                                  </a>
+                                  <button
+                                    onClick={() => handleCopyChatUrl(item.conv_id, itemUrl)}
+                                    style={{
+                                      padding: '4px 7px',
+                                      borderRadius: 6,
+                                      background: 'rgba(255,255,255,0.06)',
+                                      color: copiedUrlId === String(item.conv_id) ? C.greenLight : C.textMuted,
+                                      border: `1px solid ${C.border}`,
+                                      cursor: 'pointer',
+                                      fontSize: 11
+                                    }}
+                                    title="نسخ لينك الشات"
+                                  >
+                                    {copiedUrlId === String(item.conv_id) ? '✅' : '📋'}
+                                  </button>
+                                </div>
+                              </td>
+
+                              {/* Customer & Label */}
+                              <td style={{ padding: '10px 12px' }}>
+                                <div style={{ fontWeight: 700, color: C.textBright }}>{item.customer_name || `محادثة #${item.conv_id}`}</div>
+                                <span style={{
+                                  fontSize: 10,
+                                  padding: '1px 6px',
+                                  borderRadius: 5,
+                                  background: 'rgba(56,189,248,0.12)',
+                                  color: C.accent,
+                                  fontWeight: 700
+                                }}>
+                                  🏷️ {item.label}
+                                </span>
+                              </td>
+
+                              {/* Pulled From */}
+                              <td style={{ padding: '10px 12px' }}>
+                                <div style={{ fontWeight: 800, color: C.redLight }}>{item.from_agent_name}</div>
+                                <div style={{ fontSize: 11, color: C.textDim }}>تأخير: {item.delay_minutes} د (0 نقطة)</div>
+                              </td>
+
+                              {/* Pulled To */}
+                              <td style={{ padding: '10px 12px' }}>
+                                <div style={{ fontWeight: 800, color: C.greenLight }}>🎯 {item.to_agent_name}</div>
+                                <div style={{ fontSize: 10, color: C.textMuted }}>
+                                  السكور: <strong style={{ color: C.greenLight }}>+{item.to_agent_score}</strong> | الـ30د: {item.to_agent_window_chats || item.to_agent_open_chats}
+                                </div>
+                              </td>
+
+                              {/* Timestamp */}
+                              <td style={{ padding: '10px 12px', direction: 'ltr', color: C.textDim, fontSize: 11 }}>
+                                {item.timestamp}
+                              </td>
+
+                              {/* Inspect Button */}
+                              <td style={{ padding: '10px 12px', textAlign: 'center' }}>
+                                <button
+                                  onClick={() => setInspectorSelectedChat({ ...item, isHistoryItem: true, chatwoot_url: itemUrl })}
+                                  style={{
+                                    padding: '4px 9px',
+                                    borderRadius: 6,
+                                    background: 'rgba(168,85,247,0.18)',
+                                    color: '#e9d5ff',
+                                    border: '1px solid rgba(168,85,247,0.45)',
+                                    fontSize: 11,
+                                    fontWeight: 700,
+                                    cursor: 'pointer'
+                                  }}
+                                >
+                                  👁️ تفاصيل واللينك
+                                </button>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )
+              )}
             </div>
           </div>
         </div>

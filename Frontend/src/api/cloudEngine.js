@@ -835,16 +835,35 @@ export async function handleCloudApi(endpoint, options = {}) {
   }
 
   if (pathOnly === '/reports/resolve-audit') {
-    return db.resolve_audit || {
+    const rawAudit = db.resolve_audit?.data || db.resolve_audit || {};
+    const normalizedAudit = {
+      summary: {
+        date: new Date().toISOString().slice(0, 10),
+        total_routed: 0,
+        total_resolved: 0,
+        total_open: 0,
+        total_violations: 0,
+        total_after_shift_resolves: 0,
+        total_unanswered_inquiries: 0,
+        total_no_reply: 0,
+        total_compliant: 0,
+        resolution_rate: 0,
+        compliance_rate: 100,
+        audited_at: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
+        ...(rawAudit.summary || {})
+      },
+      agents: Array.isArray(rawAudit.agents) ? rawAudit.agents : [],
+      all_violations: Array.isArray(rawAudit.all_violations) ? rawAudit.all_violations : [],
+      all_after_shift: Array.isArray(rawAudit.all_after_shift) ? rawAudit.all_after_shift : []
+    };
+    return {
       success: true,
-      summary: { total_resolved: 0, valid_resolves: 0, suspicious_resolves: 0, compliance_rate: 100 },
-      agents: [],
-      conversations: []
+      data: normalizedAudit
     };
   }
 
   if (pathOnly === '/auto-resolver/scan' && method === 'POST') {
-    return { success: true, conversations: [], total_matched: 0 };
+    return { success: true, matched_sample: [], total_matched: 0, total_scanned: 0 };
   }
 
   if (pathOnly === '/auto-resolver/execute' && method === 'POST') {

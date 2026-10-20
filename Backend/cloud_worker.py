@@ -59,6 +59,15 @@ def run_cloud_worker():
         except Exception as e:
             logger.error(f"❌ Cloud UI poll error: {e}")
 
+        # Safety Guard: If the local PC server (app.py) is currently active, enter Standby Mode to prevent duplicate routing
+        if hf_sync.is_local_server_active():
+            logger.info("⏸️ Local PC server (app.py) is active — Cloud Worker standing by to prevent duplicate routing.")
+            elapsed_total = time.time() - start_ts
+            if max_seconds > 0 and elapsed_total >= max_seconds:
+                break
+            time.sleep(loop_interval)
+            continue
+
         # B. Periodically update official Chatwoot open chat counts
         if time.time() - last_cw_counts_ts >= 90:
             last_cw_counts_ts = time.time()

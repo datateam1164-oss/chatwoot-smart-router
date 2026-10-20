@@ -546,24 +546,18 @@ def set_routing_enabled(enabled: bool):
     if enabled:
         routing_wake_event.set()
 
-def _periodic_routing_loop():
-    logger.info("🔄 Periodic Routing Engine + Hugging Face Cloud Sync thread started...")
-    last_smart_reassign_ts = 0
-    last_cloud_push_ts = 0
-    while True:
-        needs_cloud_push = False
-        try:
-            if hf_sync.poll_and_apply_cloud_ui_changes(sys.modules[__name__]):
-                needs_cloud_push = True
-        except Exception as e:
-            logger.error(f"❌ Cloud UI poll error: {e}")
+_cloud_push_event = threading.Event()
 
+def _periodic_routing_loop():
+    logger.info("🔄 Periodic Routing Engine thread started...")
+    last_smart_reassign_ts = 0
+    while True:
         try:
             if is_routing_enabled():
                 routed = _run_single_routing_loop_safe()
                 if routed > 0:
                     logger.info(f"✅ Auto-Cycle Finished: Routed {routed} conversations.")
-                    needs_cloud_push = True
+                    _cloud_push_event.set()
         except Exception as e:
             logger.error(f"❌ Periodic routing error: {e}")
 
@@ -574,24 +568,31 @@ def _periodic_routing_loop():
                 res = _execute_smart_reassign()
                 if res.get("reassigned_count", 0) > 0:
                     logger.info(f"⚡ Auto Smart-Reassign Finished: Reassigned {res['reassigned_count']} delayed conversations.")
-                    needs_cloud_push = True
+                    _cloud_push_event.set()
             elif not cfg.get("auto_enabled"):
                 last_smart_reassign_ts = 0
         except Exception as e:
             logger.error(f"❌ Periodic smart reassign error: {e}")
-
-        try:
-            if needs_cloud_push or (time.time() - last_cloud_push_ts >= 120):
-                last_cloud_push_ts = time.time()
-                hf_sync.export_and_push_to_cloud(sys.modules[__name__], num_pages=8)
-        except Exception as e:
-            logger.error(f"❌ Periodic cloud push error: {e}")
 
         settings = database.get_settings()
         interval = int(settings.get("periodic_interval", 45))
         # Wait for interval or instant wake-up event
         routing_wake_event.wait(timeout=interval)
         routing_wake_event.clear()
+
+def _periodic_cloud_sync_loop():
+    logger.info("☁️ Dedicated Hugging Face Cloud Sync thread started (zero impact on routing speed)...")
+    last_push_ts = 0
+    while True:
+        try:
+            ui_changed = hf_sync.poll_and_apply_cloud_ui_changes(sys.modules[__name__])
+            if ui_changed or _cloud_push_event.is_set() or (time.time() - last_push_ts >= 120):
+                _cloud_push_event.clear()
+                last_push_ts = time.time()
+                hf_sync.export_and_push_to_cloud(sys.modules[__name__], num_pages=8, is_local_server=True)
+        except Exception as e:
+            logger.error(f"❌ Cloud sync thread error: {e}")
+        _cloud_push_event.wait(timeout=30)
 
 def _run_single_routing_loop_safe():
     try:
@@ -3710,6 +3711,9 @@ def bootstrap_engine(start_threads: bool = True):
 
         report_thread = threading.Thread(target=_periodic_agent_report_updater, daemon=True, name="CWReportUpdater")
         report_thread.start()
+
+        cloud_sync_thread = threading.Thread(target=_periodic_cloud_sync_loop, daemon=True, name="HFCloudSync")
+        cloud_sync_thread.start()
 
 if os.environ.get('RENDER') or os.environ.get('GUNICORN_CMD_ARGS') or os.environ.get('AUTO_BOOTSTRAP') == '1':
     bootstrap_engine(start_threads=True)

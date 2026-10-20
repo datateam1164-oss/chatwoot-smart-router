@@ -24,6 +24,12 @@ CLOUD_COMMIT_URL = f"https://huggingface.co/api/datasets/{HF_USER}/{DATASET_NAME
 
 _sync_lock = threading.Lock()
 _last_applied_ui_ts = 0
+_last_seen_local_server_ts = 0
+
+
+def is_local_server_active() -> bool:
+    """Returns True if the local PC server (app.py) pushed a heartbeat within the last 180 seconds."""
+    return (time.time() - _last_seen_local_server_ts) < 180
 
 
 def get_hf_token() -> str:
@@ -231,11 +237,12 @@ def poll_and_apply_cloud_ui_changes(app_module) -> bool:
     Applies them to SQLite and executes live Chatwoot commands immediately.
     Returns True if any change or command was processed.
     """
-    global _last_applied_ui_ts
+    global _last_applied_ui_ts, _last_seen_local_server_ts
     cloud_data = fetch_cloud_database()
     if not cloud_data or not isinstance(cloud_data, dict):
         return False
 
+    _last_seen_local_server_ts = float(cloud_data.get("local_server_active_ts") or 0)
     ui_ts = int(cloud_data.get("ui_updated_at") or 0)
     pending_cmds = cloud_data.get("pending_commands") or []
 
@@ -291,7 +298,7 @@ def poll_and_apply_cloud_ui_changes(app_module) -> bool:
     return True
 
 
-def export_and_push_to_cloud(app_module, num_pages: int = 8, summary: str = "Sync live Chatwoot router state") -> bool:
+def export_and_push_to_cloud(app_module, num_pages: int = 8, summary: str = "Sync live Chatwoot router state", is_local_server: bool = False) -> bool:
     """
     Builds a fresh snapshot of SQLite + live Chatwoot delays/scores and commits
     it to ar7222/chatwoot-smart-router-db (data.json).
@@ -394,10 +401,40 @@ def export_and_push_to_cloud(app_module, num_pages: int = 8, summary: str = "Syn
             "worker_heartbeat": datetime.now(CAIRO_TZ).strftime("%Y-%m-%d %I:%M:%S %p")
         }
 
+        resolve_audit_payload = None
+        try:
+            cache_dict = getattr(app_module, "_resolve_audit_cache", {})
+            if cache_dict:
+                latest_entry = max(cache_dict.values(), key=lambda x: x.get("timestamp", 0))
+                resolve_audit_payload = latest_entry.get("payload")
+        except Exception:
+            pass
+        if not resolve_audit_payload:
+            resolve_audit_payload = {
+                "summary": {
+                    "date": datetime.now(CAIRO_TZ).strftime("%Y-%m-%d"),
+                    "total_routed": sum(today_counts.values()),
+                    "total_resolved": 0,
+                    "total_open": 0,
+                    "total_violations": 0,
+                    "total_after_shift_resolves": 0,
+                    "total_unanswered_inquiries": 0,
+                    "total_no_reply": 0,
+                    "total_compliant": 0,
+                    "resolution_rate": 0,
+                    "compliance_rate": 100,
+                    "audited_at": datetime.now(CAIRO_TZ).strftime("%I:%M %p")
+                },
+                "agents": [],
+                "all_violations": [],
+                "all_after_shift": []
+            }
+
         cloud_data = {
             "version": 1,
             "updated_at": datetime.now(CAIRO_TZ).strftime("%Y-%m-%d %H:%M:%S"),
             "ui_updated_at": _last_applied_ui_ts,
+            "local_server_active_ts": time.time() if is_local_server else _last_seen_local_server_ts,
             "pending_commands": [],
             "status": status_obj,
             "settings": settings,
@@ -413,14 +450,7 @@ def export_and_push_to_cloud(app_module, num_pages: int = 8, summary: str = "Syn
             "pending_summary": pending_summary,
             "resolve_audit": {
                 "success": True,
-                "summary": {
-                    "total_resolved": 0,
-                    "valid_resolves": 0,
-                    "suspicious_resolves": 0,
-                    "compliance_rate": 100
-                },
-                "agents": [],
-                "conversations": []
+                "data": resolve_audit_payload
             }
         }
 

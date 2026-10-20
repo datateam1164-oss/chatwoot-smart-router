@@ -30,6 +30,8 @@ _last_resolve_audit_ts = 0
 _last_auto_resolver_pool = None
 _last_auto_resolver_ts = 0
 _last_pending_summary = None
+_last_delays_report = None
+_last_cw_labels = None
 
 
 def is_local_server_active() -> bool:
@@ -227,18 +229,30 @@ def restore_database_from_cloud(app_module=None, force_seed: bool = False) -> bo
             if isinstance(hist, list) and not app_module._smart_reassign_history:
                 app_module._smart_reassign_history.extend(hist[:30])
 
-        global _last_resolve_audit_bundle, _last_auto_resolver_pool, _last_pending_summary
+        global _last_resolve_audit_bundle, _last_resolve_audit_ts, _last_auto_resolver_pool, _last_auto_resolver_ts, _last_pending_summary, _last_delays_report, _last_cw_labels
         existing_audit = cloud_data.get("resolve_audit")
         if existing_audit and isinstance(existing_audit, dict) and existing_audit.get("data"):
             _last_resolve_audit_bundle = existing_audit
+            if _last_resolve_audit_ts == 0:
+                _last_resolve_audit_ts = time.time()
 
         existing_ar = cloud_data.get("auto_resolver_pool")
         if existing_ar and isinstance(existing_ar, dict) and existing_ar.get("items"):
             _last_auto_resolver_pool = existing_ar
+            if _last_auto_resolver_ts == 0:
+                _last_auto_resolver_ts = time.time()
 
         existing_ps = cloud_data.get("pending_summary")
         if existing_ps and isinstance(existing_ps, dict) and existing_ps.get("labels"):
             _last_pending_summary = existing_ps
+
+        existing_dr = cloud_data.get("delays_report")
+        if existing_dr and isinstance(existing_dr, dict) and existing_dr.get("summary"):
+            _last_delays_report = existing_dr
+
+        existing_lbls = (cloud_data.get("labels") or {}).get("all_labels")
+        if existing_lbls and isinstance(existing_lbls, list):
+            _last_cw_labels = existing_lbls
 
         _last_applied_ui_ts = int(cloud_data.get("ui_updated_at") or 0)
         logger.info(f"☁️ Restored state from Hugging Face Cloud Dataset ({len(cloud_agents)} agents).")
@@ -381,6 +395,23 @@ def poll_and_apply_cloud_ui_changes(app_module) -> bool:
                 if lbl:
                     ok, reopened_cnt, msg = app_module._reopen_pending_conversations(lbl, cnt)
                     logger.info(f"☁️ Executed cloud command 'reopen_pending' ({lbl}, {cnt}): ok={ok}, reopened={reopened_cnt}")
+                    if ok and reopened_cnt > 0 and app_module.is_routing_enabled():
+                        try:
+                            routed_now = app_module._run_single_routing_loop_safe()
+                            logger.info(f"⚡ Immediately routed {routed_now} reopened chats!")
+                        except Exception as re_err:
+                            logger.warning(f"⚠️ Immediate route after reopen warning: {re_err}")
+                    try:
+                        global _last_pending_summary
+                        _last_pending_summary = app_module._fetch_pending_summary(force_refresh=False)
+                    except Exception:
+                        pass
+            elif action == "refresh_pending":
+                try:
+                    _last_pending_summary = app_module._fetch_pending_summary(force_refresh=True)
+                    logger.info("☁️ Executed cloud command 'refresh_pending'")
+                except Exception as rp_err:
+                    logger.warning(f"⚠️ refresh_pending warning: {rp_err}")
         except Exception as e:
             logger.error(f"❌ Cloud command '{action}' execution error: {e}")
 
@@ -408,12 +439,13 @@ def _compact_audit_payload(payload: dict) -> dict:
     return payload
 
 
-def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Sync live Chatwoot router state", is_local_server: bool = False) -> bool:
+def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Sync live Chatwoot router state", is_local_server: bool = False, fast_only: bool = False) -> bool:
     """
     Builds a fresh snapshot of SQLite + live Chatwoot delays/scores and commits
     it to ar7222/chatwoot-smart-router-db (data.json).
+    When fast_only=True, reuses cached heavy reports so commit finishes in <1s.
     """
-    global _last_resolve_audit_bundle, _last_resolve_audit_ts, _last_auto_resolver_pool, _last_auto_resolver_ts, _last_pending_summary
+    global _last_resolve_audit_bundle, _last_resolve_audit_ts, _last_auto_resolver_pool, _last_auto_resolver_ts, _last_pending_summary, _last_delays_report, _last_cw_labels
     if not _sync_lock.acquire(blocking=False):
         return False
 
@@ -459,46 +491,61 @@ def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Syn
         except Exception:
             valid_labels_order = []
 
-        try:
-            cw_labels = app_module.fetch_chatwoot_labels()
-        except Exception:
-            cw_labels = []
+        if fast_only and _last_cw_labels:
+            cw_labels = _last_cw_labels
+        else:
+            try:
+                cw_labels = app_module.fetch_chatwoot_labels()
+                if cw_labels:
+                    _last_cw_labels = cw_labels
+            except Exception:
+                cw_labels = _last_cw_labels or []
 
-        try:
-            delays_report = app_module._build_delays_report(num_pages=num_pages)
+        if fast_only and _last_delays_report:
+            delays_report = _last_delays_report
             delays_report["smart_reassign_config"] = app_module._get_smart_reassign_config()
             delays_report["configured_sales_labels"] = valid_labels_order
             delays_report["smart_reassign_history"] = list(app_module._smart_reassign_history[:35])
-        except Exception as e:
-            logger.warning(f"⚠️ Cloud sync delays_report warning: {e}")
-            delays_report = {
-                "success": True,
-                "summary": {
-                    "total_scanned_chats": 0,
-                    "total_pending_chats": 0,
-                    "total_exempt_chats": 0,
-                    "critical_count": 0,
-                    "warning_count": 0,
-                    "normal_count": 0,
-                    "longest_delay_formatted": "0 دقيقة",
-                    "most_delayed_agent": "لا يوجد",
-                    "top_scored_agent": "لا يوجد",
-                    "timestamp": datetime.now(CAIRO_TZ).strftime("%Y-%m-%d %I:%M:%S %p")
-                },
-                "pending_chats": [],
-                "agents_summary": [],
-                "configured_sales_labels": valid_labels_order,
-                "smart_reassign_config": app_module._get_smart_reassign_config(),
-                "smart_reassign_history": list(app_module._smart_reassign_history[:35])
-            }
+        else:
+            try:
+                delays_report = app_module._build_delays_report(num_pages=num_pages)
+                delays_report["smart_reassign_config"] = app_module._get_smart_reassign_config()
+                delays_report["configured_sales_labels"] = valid_labels_order
+                delays_report["smart_reassign_history"] = list(app_module._smart_reassign_history[:35])
+                _last_delays_report = delays_report
+            except Exception as e:
+                logger.warning(f"⚠️ Cloud sync delays_report warning: {e}")
+                delays_report = _last_delays_report or {
+                    "success": True,
+                    "summary": {
+                        "total_scanned_chats": 0,
+                        "total_pending_chats": 0,
+                        "total_exempt_chats": 0,
+                        "critical_count": 0,
+                        "warning_count": 0,
+                        "normal_count": 0,
+                        "longest_delay_formatted": "0 دقيقة",
+                        "most_delayed_agent": "لا يوجد",
+                        "top_scored_agent": "لا يوجد",
+                        "timestamp": datetime.now(CAIRO_TZ).strftime("%Y-%m-%d %I:%M:%S %p")
+                    },
+                    "pending_chats": [],
+                    "agents_summary": [],
+                    "configured_sales_labels": valid_labels_order,
+                    "smart_reassign_config": app_module._get_smart_reassign_config(),
+                    "smart_reassign_history": list(app_module._smart_reassign_history[:35])
+                }
 
-        try:
-            pending_summary = app_module._fetch_pending_summary(force_refresh=False)
-            if isinstance(pending_summary, dict) and pending_summary.get("labels"):
-                _last_pending_summary = pending_summary
-        except Exception as e:
-            logger.warning(f"⚠️ Cloud sync pending_summary warning: {e}")
-            pending_summary = _last_pending_summary or {"success": True, "total_unassigned_pending": 0, "labels": []}
+        if fast_only and _last_pending_summary:
+            pending_summary = _last_pending_summary
+        else:
+            try:
+                pending_summary = app_module._fetch_pending_summary(force_refresh=True)
+                if isinstance(pending_summary, dict) and pending_summary.get("labels"):
+                    _last_pending_summary = pending_summary
+            except Exception as e:
+                logger.warning(f"⚠️ Cloud sync pending_summary warning: {e}")
+                pending_summary = _last_pending_summary or {"success": True, "total_unassigned_pending": 0, "labels": []}
 
         selected_in_shift = [
             a for a in enriched_agents if a.get("is_selected") and not a.get("is_paused") and a.get("in_shift")
@@ -521,12 +568,13 @@ def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Syn
             and isinstance(_last_resolve_audit_bundle.get("data"), dict)
             and len((_last_resolve_audit_bundle.get("data") or {}).get("agents") or []) > 0
         )
-        if not has_valid_audit or (now_ts - _last_resolve_audit_ts >= 600):
+        if not fast_only and (not has_valid_audit or (now_ts - _last_resolve_audit_ts >= 900)):
             try:
+                existing_ranges = (_last_resolve_audit_bundle or {}).get("ranges") or {}
                 audit_today = _compact_audit_payload(app_module.audit_conversations_for_agents(date_str="today", source="chatwoot"))
-                audit_yesterday = _compact_audit_payload(app_module.audit_conversations_for_agents(date_str="yesterday", source="chatwoot"))
-                audit_2days = _compact_audit_payload(app_module.audit_conversations_for_agents(date_str="2days", source="chatwoot"))
                 audit_sys_today = _compact_audit_payload(app_module.audit_conversations_for_agents(date_str="today", source="system"))
+                audit_yesterday = existing_ranges.get("chatwoot_yesterday") or _compact_audit_payload(app_module.audit_conversations_for_agents(date_str="yesterday", source="chatwoot"))
+                audit_2days = existing_ranges.get("chatwoot_2days") or _compact_audit_payload(app_module.audit_conversations_for_agents(date_str="2days", source="chatwoot"))
                 _last_resolve_audit_bundle = {
                     "success": True,
                     "data": audit_today,
@@ -569,7 +617,7 @@ def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Syn
             isinstance(_last_auto_resolver_pool, dict)
             and isinstance(_last_auto_resolver_pool.get("items"), list)
         )
-        if not has_valid_ar or (now_ts - _last_auto_resolver_ts >= 600):
+        if not fast_only and (not has_valid_ar or (now_ts - _last_auto_resolver_ts >= 900)):
             try:
                 _last_auto_resolver_pool = _build_auto_resolver_pool(app_module, max_pages=20, min_hours=24.0)
                 _last_auto_resolver_ts = now_ts

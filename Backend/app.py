@@ -2645,7 +2645,7 @@ def _fetch_pending_summary(force_refresh=False):
         return lbl, 0
 
     label_counts = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
         futures = [executor.submit(_get_count_for_label, lbl) for lbl in labels_to_check]
         for f in concurrent.futures.as_completed(futures):
             lbl, cnt = f.result()
@@ -2761,13 +2761,20 @@ def _reopen_pending_conversations(label: str, count: int) -> tuple[bool, int, st
         return False
 
     success_count = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
         results = executor.map(_toggle_open, target_cids)
         success_count = sum(1 for ok in results if ok)
 
-    # Invalidate cache
+    # Optimistically update cache so immediate reads reflect the reopened count without waiting
     with pending_summary_lock:
-        pending_summary_cache["data"] = None
+        if isinstance(pending_summary_cache.get("data"), dict):
+            cached = pending_summary_cache["data"]
+            cached["total_unassigned_pending"] = max(0, int(cached.get("total_unassigned_pending", 0)) - success_count)
+            cached["timestamp"] = datetime.now(CAIRO_TZ).isoformat()
+            for item in (cached.get("labels") or []):
+                if item.get("label") == label or (is_unlabeled and item.get("label") == "unlabeled"):
+                    item["pending_count"] = max(0, int(item.get("pending_count", 0)) - success_count)
+            pending_summary_cache["timestamp"] = time.time()
 
     logger.info(f"🔓 Reopened {success_count}/{len(target_cids)} pending conversations for label '{label}'")
     return True, success_count, f"تمت إعادة فتح {success_count} محادثة بنجاح للتصنيف '{label}' وتحويلها إلى قيد التوزيع (Open)."

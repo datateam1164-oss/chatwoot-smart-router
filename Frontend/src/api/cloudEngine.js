@@ -31,9 +31,14 @@ async function sha256Hex(message) {
 let _cloudCache = null;
 let _cloudCacheTs = 0;
 let _staticBundleCache = null;
+let _optimisticPendingSummary = null;
+let _optimisticPendingUntil = 0;
 
 async function hydrateMissingFromStaticBundle(data) {
   if (!data || typeof data !== 'object') return data;
+  if (_optimisticPendingSummary && Date.now() < _optimisticPendingUntil) {
+    data.pending_summary = _optimisticPendingSummary;
+  }
   const missingPending = !Array.isArray(data.pending_summary?.labels) || data.pending_summary.labels.length === 0;
   const missingAutoResolver = !Array.isArray(data.auto_resolver_pool?.items) || data.auto_resolver_pool.items.length === 0;
   const missingResolveAudit = !Array.isArray(data.resolve_audit?.data?.agents) || data.resolve_audit.data.agents.length === 0;
@@ -856,12 +861,20 @@ export async function handleCloudApi(endpoint, options = {}) {
 
   // ── Pending Summary, CRM Sync, Resolve Audit, Auto Resolver ──
   if (pathOnly === '/pending-conversations/summary') {
+    const isForce = params.get('force') === 'true';
     const ps = db.pending_summary || {};
+    if (isForce) {
+      ps.timestamp = new Date().toISOString();
+      saveCloudDatabase(db, 'Refresh pending conversations summary', {
+        action: 'refresh_pending',
+        payload: {}
+      }).catch(() => {});
+    }
     return {
       success: true,
       total_unassigned_pending: Number(ps.total_unassigned_pending ?? ps.total_pending ?? 0),
       labels: Array.isArray(ps.labels) ? ps.labels : (Array.isArray(ps.labels_list) ? ps.labels_list : []),
-      timestamp: ps.timestamp || new Date().toISOString()
+      timestamp: isForce ? new Date().toISOString() : (ps.timestamp || new Date().toISOString())
     };
   }
 
@@ -883,17 +896,23 @@ export async function handleCloudApi(endpoint, options = {}) {
           Number(db.pending_summary.total_unassigned_pending || 0) - actualReopened
         );
       }
+      db.pending_summary.timestamp = new Date().toISOString();
+      _optimisticPendingSummary = JSON.parse(JSON.stringify(db.pending_summary));
+      _optimisticPendingUntil = Date.now() + 15000;
     }
 
-    await saveCloudDatabase(db, `Reopen ${actualReopened} pending chats for ${label}`, {
+    // Commit to Cloud Dataset in background so UI responds in <10ms
+    saveCloudDatabase(db, `Reopen ${actualReopened} pending chats for ${label}`, {
       action: 'reopen_pending',
       payload: { label, count: reqCount }
-    });
+    }).catch(err => console.warn('Background reopen commit warning:', err));
+
     return {
       success: true,
       reopened_count: actualReopened,
       label,
-      message: `تمت إعادة فتح ${actualReopened} محادثة للتصنيف '${label}' وإرسالها للتوزيع.`
+      summary: db.pending_summary,
+      message: `⚡ تمت إعادة فتح ${actualReopened} محادثة للتصنيف '${label}' وإرسالها للتوزيع الفوري.`
     };
   }
 

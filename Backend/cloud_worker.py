@@ -6,6 +6,7 @@ import os
 import sys
 import time
 import logging
+import threading
 
 BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 if BACKEND_DIR not in sys.path:
@@ -19,9 +20,21 @@ import app as router_app
 logger = logging.getLogger("CloudWorker")
 
 
+def _heavy_reports_sync_loop():
+    """Background daemon thread that refreshes delays_report, pending_summary, and resolve_audit without blocking fast UI commands."""
+    time.sleep(10)
+    while True:
+        try:
+            if not hf_sync.is_local_server_active():
+                hf_sync.export_and_push_to_cloud(router_app, num_pages=0, fast_only=False)
+        except Exception as e:
+            logger.error(f"❌ Heavy reports background sync error: {e}")
+        time.sleep(90)
+
+
 def run_cloud_worker():
     max_seconds = int(os.environ.get("CLOUD_WORKER_MAX_SECONDS", "0"))
-    loop_interval = int(os.environ.get("CLOUD_WORKER_INTERVAL", "35"))
+    fast_poll_interval = 4
     start_ts = time.time()
 
     logger.info("☁️ Starting 24/7 Cloud Worker (Chatwoot <-> Hugging Face Dataset)...")
@@ -44,18 +57,22 @@ def run_cloud_worker():
     except Exception as e:
         logger.warning(f"⚠️ Initial CRM shift sync warning: {e}")
 
+    # Start non-blocking background thread for heavy reports (delays, pending counts, resolve audit)
+    bg_thread = threading.Thread(target=_heavy_reports_sync_loop, daemon=True)
+    bg_thread.start()
+
     last_smart_reassign_ts = 0
-    last_cloud_push_ts = 0
     last_cw_counts_ts = 0
+    last_routing_ts = 0
 
     while True:
         cycle_start = time.time()
-        needs_push = False
+        needs_fast_push = False
 
-        # A. Poll UI changes & pending commands from Static Space (ar7222-chatwoot-smart-router.static.hf.space)
+        # A. Poll UI changes & pending commands every 4 seconds (reopen_pending, refresh_pending, run_cycle, etc.)
         try:
             if hf_sync.poll_and_apply_cloud_ui_changes(router_app):
-                needs_push = True
+                needs_fast_push = True
         except Exception as e:
             logger.error(f"❌ Cloud UI poll error: {e}")
 
@@ -65,10 +82,10 @@ def run_cloud_worker():
             elapsed_total = time.time() - start_ts
             if max_seconds > 0 and elapsed_total >= max_seconds:
                 break
-            time.sleep(loop_interval)
+            time.sleep(15)
             continue
 
-        # B. Periodically update official Chatwoot open chat counts
+        # B. Periodically update official Chatwoot open chat counts (every 90s)
         if time.time() - last_cw_counts_ts >= 90:
             last_cw_counts_ts = time.time()
             try:
@@ -78,15 +95,17 @@ def run_cloud_worker():
             except Exception as e:
                 logger.warning(f"⚠️ Chatwoot open counts refresh warning: {e}")
 
-        # C. Run Smart Routing Cycle if enabled
-        try:
-            if router_app.is_routing_enabled():
-                routed = router_app._run_single_routing_loop_safe()
-                if routed > 0:
-                    logger.info(f"✅ Cloud Worker Routed {routed} conversations.")
-                    needs_push = True
-        except Exception as e:
-            logger.error(f"❌ Cloud routing cycle error: {e}")
+        # C. Run Smart Routing Cycle every 15s if enabled
+        if time.time() - last_routing_ts >= 15:
+            last_routing_ts = time.time()
+            try:
+                if router_app.is_routing_enabled():
+                    routed = router_app._run_single_routing_loop_safe()
+                    if routed > 0:
+                        logger.info(f"✅ Cloud Worker Routed {routed} conversations.")
+                        needs_fast_push = True
+            except Exception as e:
+                logger.error(f"❌ Cloud routing cycle error: {e}")
 
         # D. Run Auto Smart-Reassign (Delayed >15m -> Same-Label Highest Score Agent) if enabled
         try:
@@ -96,24 +115,23 @@ def run_cloud_worker():
                 res = router_app._execute_smart_reassign()
                 if res.get("reassigned_count", 0) > 0:
                     logger.info(f"⚡ Cloud Worker Reassigned {res['reassigned_count']} delayed conversations.")
-                    needs_push = True
+                    needs_fast_push = True
         except Exception as e:
             logger.error(f"❌ Cloud smart reassign error: {e}")
 
-        # E. Push fresh live state (delays report, scores +7/+5/0, agents, logs) to HF Dataset every 2 mins or on change
-        try:
-            if needs_push or (time.time() - last_cloud_push_ts >= 120):
-                last_cloud_push_ts = time.time()
-                hf_sync.export_and_push_to_cloud(router_app, num_pages=0)
-        except Exception as e:
-            logger.error(f"❌ Cloud dataset push error: {e}")
+        # E. Push fast state immediately (< 0.8s) whenever a UI command or routing event occurred
+        if needs_fast_push:
+            try:
+                hf_sync.export_and_push_to_cloud(router_app, fast_only=True, summary="Fast sync after command/routing")
+            except Exception as e:
+                logger.error(f"❌ Cloud fast push error: {e}")
 
         elapsed_total = time.time() - start_ts
         if max_seconds > 0 and elapsed_total >= max_seconds:
             logger.info(f"🏁 Cloud Worker reached max runtime ({int(elapsed_total)}s). Exiting cleanly for next scheduled run.")
             break
 
-        sleep_for = max(5, loop_interval - int(time.time() - cycle_start))
+        sleep_for = max(2, fast_poll_interval - int(time.time() - cycle_start))
         time.sleep(sleep_for)
 
 

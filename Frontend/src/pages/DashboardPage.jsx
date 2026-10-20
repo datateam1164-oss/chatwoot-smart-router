@@ -98,6 +98,14 @@ export default function DashboardPage() {
     try {
       const res = await agentsApi.getPendingSummary(force);
       setPendingSummary(res);
+      if (force) {
+        showNotification('🔄 تم تحديث أرقام المحادثات المعلقة بنجاح', 'success');
+        setTimeout(() => {
+          agentsApi.getPendingSummary(false).then(r => {
+            if (r && Array.isArray(r.labels)) setPendingSummary(r);
+          }).catch(() => {});
+        }, 5000);
+      }
     } catch {
       showNotification('فشل جلب إحصائيات المعلقات', 'error');
     } finally {
@@ -576,8 +584,12 @@ export default function DashboardPage() {
   const handleReopenPendingLabel = async (label, count) => {
     try {
       const res = await agentsApi.reopenPending(label, count);
+      if (res?.summary && Array.isArray(res.summary.labels)) {
+        setPendingSummary({ ...res.summary });
+      } else {
+        loadPendingSummary(true);
+      }
       showNotification(res.message || `تمت إعادة فتح ${res.reopened_count || count} محادثة بنجاح`, 'success');
-      await loadPendingSummary(true);
       loadData();
     } catch (err) {
       showNotification(err.message || 'فشل إعادة فتح المحادثات', 'error');

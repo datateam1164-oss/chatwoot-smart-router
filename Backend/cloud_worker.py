@@ -89,9 +89,7 @@ def run_cloud_worker():
         if time.time() - last_cw_counts_ts >= 90:
             last_cw_counts_ts = time.time()
             try:
-                counts = router_app.fetch_agent_report_counts()
-                if counts:
-                    database.update_agents_active_chats_bulk(counts)
+                router_app.fetch_agent_report_counts(force_refresh=True)
             except Exception as e:
                 logger.warning(f"⚠️ Chatwoot open counts refresh warning: {e}")
 

@@ -364,20 +364,25 @@ export const AgentTableView = memo(function AgentTableView({
 
                   {/* Chatwoot Open Chats */}
                   <td style={{ padding: '12px 14px', textAlign: 'center' }}>
-                    <span style={{
-                      fontSize: 12,
-                      fontWeight: 800,
-                      padding: '2px 8px',
-                      borderRadius: 6,
-                      background: (agent.chatwoot_open_chats || 0) > 15
-                        ? 'var(--badge-capped-bg)'
-                        : 'var(--primary-bg)',
-                      color: (agent.chatwoot_open_chats || 0) > 15 ? 'var(--badge-capped-text)' : 'var(--primary)',
-                      border: `1px solid ${(agent.chatwoot_open_chats || 0) > 15 ? 'var(--badge-capped-border)' : 'var(--primary-border)'}`,
-                      fontVariantNumeric: 'tabular-nums'
-                    }}>
-                      {agent.chatwoot_open_chats ?? 0}
-                    </span>
+                    {(() => {
+                      const openChats = Number(agent.chatwoot_open_chats ?? agent.active_chats ?? 0);
+                      return (
+                        <span style={{
+                          fontSize: 12,
+                          fontWeight: 800,
+                          padding: '2px 8px',
+                          borderRadius: 6,
+                          background: openChats > 15
+                            ? 'var(--badge-capped-bg)'
+                            : 'var(--primary-bg)',
+                          color: openChats > 15 ? 'var(--badge-capped-text)' : 'var(--primary)',
+                          border: `1px solid ${openChats > 15 ? 'var(--badge-capped-border)' : 'var(--primary-border)'}`,
+                          fontVariantNumeric: 'tabular-nums'
+                        }}>
+                          {openChats}
+                        </span>
+                      );
+                    })()}
                   </td>
 
                   {/* Assigned Labels */}

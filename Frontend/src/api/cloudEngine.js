@@ -42,30 +42,62 @@ async function hydrateMissingFromStaticBundle(data) {
   const missingPending = !Array.isArray(data.pending_summary?.labels) || data.pending_summary.labels.length === 0;
   const missingAutoResolver = !Array.isArray(data.auto_resolver_pool?.items) || data.auto_resolver_pool.items.length === 0;
   const missingResolveAudit = !Array.isArray(data.resolve_audit?.data?.agents) || data.resolve_audit.data.agents.length === 0;
+  const missingOpenChats = Array.isArray(data.agents) && !data.agents.some(a => Number(a.chatwoot_open_chats || a.active_chats || 0) > 0);
 
-  if (!missingPending && !missingAutoResolver && !missingResolveAudit) {
-    return data;
+  if (missingPending || missingAutoResolver || missingResolveAudit || missingOpenChats) {
+    try {
+      if (!_staticBundleCache) {
+        const r = await fetch(`./data.json?v=static`, { cache: 'no-store' });
+        if (r.ok) {
+          _staticBundleCache = await r.json();
+        }
+      }
+      if (_staticBundleCache) {
+        if (missingPending && _staticBundleCache.pending_summary?.labels?.length > 0) {
+          data.pending_summary = _staticBundleCache.pending_summary;
+        }
+        if (missingAutoResolver && _staticBundleCache.auto_resolver_pool?.items?.length > 0) {
+          data.auto_resolver_pool = _staticBundleCache.auto_resolver_pool;
+        }
+        if (missingResolveAudit && _staticBundleCache.resolve_audit?.data?.agents?.length > 0) {
+          data.resolve_audit = _staticBundleCache.resolve_audit;
+        }
+        if (missingOpenChats && Array.isArray(_staticBundleCache.agents)) {
+          const staticOpenMap = {};
+          _staticBundleCache.agents.forEach(sa => {
+            const cnt = Number(sa.chatwoot_open_chats ?? sa.active_chats ?? 0);
+            if (cnt > 0) staticOpenMap[String(sa.id)] = cnt;
+          });
+          data.agents.forEach(a => {
+            const sCnt = staticOpenMap[String(a.id)] || 0;
+            if (sCnt > 0) {
+              a.active_chats = sCnt;
+              a.chatwoot_open_chats = sCnt;
+            }
+          });
+        }
+      }
+    } catch (_) {}
   }
 
-  try {
-    if (!_staticBundleCache) {
-      const r = await fetch(`./data.json?v=static`, { cache: 'no-store' });
-      if (r.ok) {
-        _staticBundleCache = await r.json();
-      }
+  // Always ensure chatwoot_open_chats and active_chats are synced with delays_report.agents_summary
+  const delaysOpenMap = {};
+  (data.delays_report?.agents_summary || []).forEach(as => {
+    if (as.agent_id) {
+      delaysOpenMap[String(as.agent_id)] = Number(as.open_chats_count || 0);
     }
-    if (_staticBundleCache) {
-      if (missingPending && _staticBundleCache.pending_summary?.labels?.length > 0) {
-        data.pending_summary = _staticBundleCache.pending_summary;
-      }
-      if (missingAutoResolver && _staticBundleCache.auto_resolver_pool?.items?.length > 0) {
-        data.auto_resolver_pool = _staticBundleCache.auto_resolver_pool;
-      }
-      if (missingResolveAudit && _staticBundleCache.resolve_audit?.data?.agents?.length > 0) {
-        data.resolve_audit = _staticBundleCache.resolve_audit;
-      }
-    }
-  } catch (_) {}
+  });
+  if (Array.isArray(data.agents)) {
+    data.agents.forEach(a => {
+      const openCnt = Math.max(
+        Number(a.chatwoot_open_chats || 0),
+        Number(a.active_chats || 0),
+        delaysOpenMap[String(a.id)] || 0
+      );
+      a.active_chats = openCnt;
+      a.chatwoot_open_chats = openCnt;
+    });
+  }
 
   return data;
 }
@@ -925,7 +957,19 @@ export async function handleCloudApi(endpoint, options = {}) {
   }
 
   if (pathOnly === '/agents/refresh-cw-counts' && method === 'POST') {
-    return { success: true, counts: {} };
+    const counts = {};
+    (db.agents || []).forEach(a => {
+      counts[String(a.id)] = Number(a.chatwoot_open_chats ?? a.active_chats ?? 0);
+    });
+    saveCloudDatabase(db, 'Refresh Chatwoot open chat counts', {
+      action: 'refresh_cw_counts',
+      payload: {}
+    }).catch(() => {});
+    return {
+      success: true,
+      counts,
+      message: `🔄 تم تحديث أرقام الشاتات المفتوحة من شات ووت بنجاح (${Object.keys(counts).length} موظف).`
+    };
   }
 
   if (pathOnly === '/reports/resolve-audit') {

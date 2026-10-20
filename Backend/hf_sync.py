@@ -412,6 +412,12 @@ def poll_and_apply_cloud_ui_changes(app_module) -> bool:
                     logger.info("☁️ Executed cloud command 'refresh_pending'")
                 except Exception as rp_err:
                     logger.warning(f"⚠️ refresh_pending warning: {rp_err}")
+            elif action == "refresh_cw_counts":
+                try:
+                    counts = app_module.fetch_agent_report_counts(force_refresh=True)
+                    logger.info(f"☁️ Executed cloud command 'refresh_cw_counts' ({len(counts)} agents)")
+                except Exception as cw_err:
+                    logger.warning(f"⚠️ refresh_cw_counts warning: {cw_err}")
         except Exception as e:
             logger.error(f"❌ Cloud command '{action}' execution error: {e}")
 
@@ -456,6 +462,14 @@ def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Syn
         pulled_counts = database.get_all_agents_pulled_counts_today()
         window_minutes = int(settings.get("window_minutes", 30))
 
+        with app_module._agent_report_lock:
+            cw_counts = dict(app_module._agent_report_cache)
+        if not cw_counts and not fast_only:
+            try:
+                cw_counts = app_module.fetch_agent_report_counts()
+            except Exception:
+                cw_counts = {}
+
         enriched_agents = []
         for ag in all_agents:
             ag = database.check_and_reset_agent_window(ag, window_minutes=window_minutes)
@@ -475,6 +489,11 @@ def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Syn
             ag_copy["today_chats_count"] = today_counts.get(aid, 0)
             ag_copy["pulled_today_count"] = pulled_counts.get(aid, 0)
             ag_copy["daily_chat_limit"] = ag_copy.get("daily_chat_limit") or 100
+            open_cnt = cw_counts.get(aid)
+            if open_cnt is None:
+                open_cnt = ag_copy.get("chatwoot_open_chats") if ag_copy.get("chatwoot_open_chats") is not None else ag_copy.get("active_chats", 0)
+            ag_copy["active_chats"] = int(open_cnt or 0)
+            ag_copy["chatwoot_open_chats"] = int(open_cnt or 0)
             enriched_agents.append(ag_copy)
 
         mappings = database.get_all_mappings()
@@ -535,6 +554,17 @@ def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Syn
                     "smart_reassign_config": app_module._get_smart_reassign_config(),
                     "smart_reassign_history": list(app_module._smart_reassign_history[:35])
                 }
+
+        delays_open_map = {
+            str(item.get("agent_id")): int(item.get("open_chats_count") or 0)
+            for item in (delays_report.get("agents_summary") or [])
+            if item.get("agent_id")
+        }
+        for ag_item in enriched_agents:
+            aid_s = str(ag_item.get("id"))
+            best_open = max(int(ag_item.get("chatwoot_open_chats") or 0), int(ag_item.get("active_chats") or 0), delays_open_map.get(aid_s, 0))
+            ag_item["active_chats"] = best_open
+            ag_item["chatwoot_open_chats"] = best_open
 
         if fast_only and _last_pending_summary:
             pending_summary = _last_pending_summary

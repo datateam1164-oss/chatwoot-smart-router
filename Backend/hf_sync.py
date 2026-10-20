@@ -305,6 +305,27 @@ def poll_and_apply_cloud_ui_changes(app_module) -> bool:
     return True
 
 
+def _compact_audit_payload(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        return payload
+    for ch in (payload.get("all_violations") or []):
+        if ch.get("last_content"):
+            ch["last_content"] = ch["last_content"][:80]
+    for ch in (payload.get("all_after_shift") or []):
+        if ch.get("last_content"):
+            ch["last_content"] = ch["last_content"][:80]
+    for ag in (payload.get("agents") or []):
+        chats = ag.get("chats") or []
+        important = [c for c in chats if c.get("is_violation") or c.get("is_after_shift")][:40]
+        others = [c for c in chats if not c.get("is_violation") and not c.get("is_after_shift")][:6]
+        kept = important + others
+        for c in kept:
+            if c.get("last_content"):
+                c["last_content"] = c["last_content"][:75]
+        ag["chats"] = kept
+    return payload
+
+
 def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Sync live Chatwoot router state", is_local_server: bool = False) -> bool:
     """
     Builds a fresh snapshot of SQLite + live Chatwoot delays/scores and commits
@@ -417,15 +438,14 @@ def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Syn
         )
         if not has_valid_audit or (now_ts - _last_resolve_audit_ts >= 600):
             try:
-                audit_today = app_module.audit_conversations_for_agents(date_str="today", source="chatwoot")
-                audit_yesterday = app_module.audit_conversations_for_agents(date_str="yesterday", source="chatwoot")
-                audit_2days = app_module.audit_conversations_for_agents(date_str="2days", source="chatwoot")
-                audit_sys_today = app_module.audit_conversations_for_agents(date_str="today", source="system")
+                audit_today = _compact_audit_payload(app_module.audit_conversations_for_agents(date_str="today", source="chatwoot"))
+                audit_yesterday = _compact_audit_payload(app_module.audit_conversations_for_agents(date_str="yesterday", source="chatwoot"))
+                audit_2days = _compact_audit_payload(app_module.audit_conversations_for_agents(date_str="2days", source="chatwoot"))
+                audit_sys_today = _compact_audit_payload(app_module.audit_conversations_for_agents(date_str="today", source="system"))
                 _last_resolve_audit_bundle = {
                     "success": True,
                     "data": audit_today,
                     "ranges": {
-                        "chatwoot_today": audit_today,
                         "chatwoot_yesterday": audit_yesterday,
                         "chatwoot_2days": audit_2days,
                         "system_today": audit_sys_today
@@ -496,7 +516,7 @@ def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Syn
                 "Content-Type": "application/x-ndjson"
             },
             data=ndjson_body.encode("utf-8"),
-            timeout=35
+            timeout=90
         )
         if r.status_code in (200, 201):
             logger.info("☁️ Successfully synced live Chatwoot state to Hugging Face Dataset (data.json).")

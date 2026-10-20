@@ -8,7 +8,7 @@ import time
 import base64
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 import requests
 
@@ -601,10 +601,23 @@ def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Syn
         if not fast_only and (not has_valid_audit or (now_ts - _last_resolve_audit_ts >= 900)):
             try:
                 existing_ranges = (_last_resolve_audit_bundle or {}).get("ranges") or {}
+                expected_yest = (datetime.now(CAIRO_TZ) - timedelta(days=1)).strftime("%Y-%m-%d")
+                cached_yest = existing_ranges.get("chatwoot_yesterday") or {}
+                cached_yest_date = (cached_yest.get("summary") or {}).get("date", "")
+                day_changed = (cached_yest_date != expected_yest)
+
                 audit_today = _compact_audit_payload(app_module.audit_conversations_for_agents(date_str="today", source="chatwoot"))
                 audit_sys_today = _compact_audit_payload(app_module.audit_conversations_for_agents(date_str="today", source="system"))
-                audit_yesterday = existing_ranges.get("chatwoot_yesterday") or _compact_audit_payload(app_module.audit_conversations_for_agents(date_str="yesterday", source="chatwoot"))
-                audit_2days = existing_ranges.get("chatwoot_2days") or _compact_audit_payload(app_module.audit_conversations_for_agents(date_str="2days", source="chatwoot"))
+                audit_yesterday = (
+                    _compact_audit_payload(app_module.audit_conversations_for_agents(date_str="yesterday", source="chatwoot"))
+                    if (day_changed or not cached_yest)
+                    else cached_yest
+                )
+                audit_2days = (
+                    _compact_audit_payload(app_module.audit_conversations_for_agents(date_str="2days", source="chatwoot"))
+                    if (day_changed or not existing_ranges.get("chatwoot_2days"))
+                    else existing_ranges.get("chatwoot_2days")
+                )
                 _last_resolve_audit_bundle = {
                     "success": True,
                     "data": audit_today,

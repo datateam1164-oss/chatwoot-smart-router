@@ -246,8 +246,29 @@ export async function saveCloudDatabase(dbData, summaryMessage = 'Update cloud d
   return res.json();
 }
 
+function computeAgentInShift(ag) {
+  const s = ag.shift_start;
+  const e = ag.shift_end;
+  if (s === null || s === undefined || e === null || e === undefined) return false;
+  const txt = String(ag.shift_text || '').toLowerCase();
+  if (txt.includes('weekend') || txt.includes('off')) return false;
+  const nowCairo = new Date(new Date().toLocaleString('en-US', { timeZone: 'Africa/Cairo' }));
+  const h = nowCairo.getHours();
+  const startH = Number(s);
+  const endH = Number(e);
+  if (startH < endH) {
+    return h >= startH && h < endH;
+  } else if (startH > endH) {
+    return h >= startH || h < endH;
+  }
+  return false;
+}
+
 function recomputeStatus(db) {
   const agents = db.agents || [];
+  agents.forEach(a => {
+    a.in_shift = computeAgentInShift(a);
+  });
   const salesAgents = agents.filter(a => ['Sales', 'Data'].includes(a.team));
   const selectedAgents = salesAgents.filter(a => a.is_selected);
   const activeInShift = selectedAgents.filter(a => !a.is_paused && a.in_shift);
@@ -569,6 +590,14 @@ export async function handleCloudApi(endpoint, options = {}) {
     return { success: true, message: 'تم إنشاء المستخدم بنجاح' };
   }
 
+  const deleteUserMatch = pathOnly.match(/^\/users\/([^/]+)$/);
+  if (deleteUserMatch && method === 'DELETE') {
+    const uid = deleteUserMatch[1];
+    db.users = (db.users || []).filter(u => String(u.id) !== String(uid));
+    await saveCloudDatabase(db, `Delete user #${uid}`);
+    return { success: true, message: 'تم حذف المستخدم بنجاح' };
+  }
+
   // ── Status & Agents Endpoints ──
   if (pathOnly === '/status') {
     recomputeStatus(db);
@@ -576,6 +605,7 @@ export async function handleCloudApi(endpoint, options = {}) {
   }
 
   if (pathOnly === '/agents' && method === 'GET') {
+    recomputeStatus(db);
     return { agents: db.agents || [] };
   }
 
@@ -688,6 +718,7 @@ export async function handleCloudApi(endpoint, options = {}) {
       ag.shift_end = Number(body.shift_end);
       ag.shift_text = body.shift_text || `${body.shift_start} - ${body.shift_end}`;
       ag.is_manual_shift = 1;
+      recomputeStatus(db);
       await saveCloudDatabase(db, `Update manual shift for agent #${aid}`);
     }
     return { success: true };
@@ -702,6 +733,7 @@ export async function handleCloudApi(endpoint, options = {}) {
       ag.shift_end = ag.crm_shift_end ?? ag.shift_end;
       ag.shift_text = ag.crm_shift_text || ag.shift_text;
       ag.is_manual_shift = 0;
+      recomputeStatus(db);
       await saveCloudDatabase(db, `Reset shift to CRM for agent #${aid}`);
     }
     return { success: true };
@@ -717,6 +749,41 @@ export async function handleCloudApi(endpoint, options = {}) {
     });
     await saveCloudDatabase(db, 'Apply label preset to agents');
     return { success: true };
+  }
+
+  if (pathOnly === '/teams/labels' && method === 'POST') {
+    const coord = String(body.coordinator_name || '').trim().toLowerCase();
+    const lbls = Array.isArray(body.labels) ? body.labels : [];
+    let affected = 0;
+    (db.agents || []).forEach(ag => {
+      const agCoord = String(ag.coordinator_name || '').trim().toLowerCase();
+      const isUnassigned = !agCoord || agCoord === 'none' || agCoord === 'بدون كوردينيتور';
+      if ((coord === '__unassigned__' && isUnassigned) || agCoord === coord) {
+        ag.assigned_labels = lbls;
+        affected++;
+      }
+    });
+    await saveCloudDatabase(db, `Update team labels for ${coord} (${affected} agents)`);
+    return {
+      success: true,
+      coordinator_name: body.coordinator_name,
+      affected,
+      assigned_labels: lbls,
+      message: `تم بنجاح تحديث تصنيفات التيم (${affected} موظف)`
+    };
+  }
+
+  if (pathOnly === '/crm/login' && method === 'POST') {
+    db.settings = {
+      ...(db.settings || {}),
+      crm_email: body.email || '',
+      crm_password: body.password || ''
+    };
+    await saveCloudDatabase(db, 'Update CRM login credentials and sync shifts', {
+      action: 'crm_sync',
+      payload: {}
+    });
+    return { success: true, message: 'تم حفظ بيانات الـ CRM وإرسال طلب مزامنة الشيفتات' };
   }
 
   const agentChatsMatch = pathOnly.match(/^\/agents\/([^/]+)\/chats$/);

@@ -30,6 +30,40 @@ async function sha256Hex(message) {
 
 let _cloudCache = null;
 let _cloudCacheTs = 0;
+let _staticBundleCache = null;
+
+async function hydrateMissingFromStaticBundle(data) {
+  if (!data || typeof data !== 'object') return data;
+  const missingPending = !Array.isArray(data.pending_summary?.labels) || data.pending_summary.labels.length === 0;
+  const missingAutoResolver = !Array.isArray(data.auto_resolver_pool?.items) || data.auto_resolver_pool.items.length === 0;
+  const missingResolveAudit = !Array.isArray(data.resolve_audit?.data?.agents) || data.resolve_audit.data.agents.length === 0;
+
+  if (!missingPending && !missingAutoResolver && !missingResolveAudit) {
+    return data;
+  }
+
+  try {
+    if (!_staticBundleCache) {
+      const r = await fetch(`./data.json?v=static`, { cache: 'no-store' });
+      if (r.ok) {
+        _staticBundleCache = await r.json();
+      }
+    }
+    if (_staticBundleCache) {
+      if (missingPending && _staticBundleCache.pending_summary?.labels?.length > 0) {
+        data.pending_summary = _staticBundleCache.pending_summary;
+      }
+      if (missingAutoResolver && _staticBundleCache.auto_resolver_pool?.items?.length > 0) {
+        data.auto_resolver_pool = _staticBundleCache.auto_resolver_pool;
+      }
+      if (missingResolveAudit && _staticBundleCache.resolve_audit?.data?.agents?.length > 0) {
+        data.resolve_audit = _staticBundleCache.resolve_audit;
+      }
+    }
+  } catch (_) {}
+
+  return data;
+}
 
 export async function loadCloudDatabase(forceRefresh = false) {
   const now = Date.now();
@@ -45,7 +79,7 @@ export async function loadCloudDatabase(forceRefresh = false) {
       }
     });
     if (res.ok) {
-      const data = await res.json();
+      const data = await hydrateMissingFromStaticBundle(await res.json());
       _cloudCache = data;
       _cloudCacheTs = Date.now();
       return data;
@@ -57,7 +91,7 @@ export async function loadCloudDatabase(forceRefresh = false) {
   try {
     const res2 = await fetch(`${CLOUD_DATA_URL}?t=${now}`, { cache: 'no-store' });
     if (res2.ok) {
-      const data = await res2.json();
+      const data = await hydrateMissingFromStaticBundle(await res2.json());
       _cloudCache = data;
       _cloudCacheTs = Date.now();
       return data;

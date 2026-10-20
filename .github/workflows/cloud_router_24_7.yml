@@ -9,7 +9,7 @@ on:
 
 concurrency:
   group: chatwoot-cloud-router-24-7
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 jobs:
   cloud-router-worker:

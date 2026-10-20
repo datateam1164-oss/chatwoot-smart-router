@@ -29,6 +29,7 @@ _last_resolve_audit_bundle = None
 _last_resolve_audit_ts = 0
 _last_auto_resolver_pool = None
 _last_auto_resolver_ts = 0
+_last_pending_summary = None
 
 
 def is_local_server_active() -> bool:
@@ -226,7 +227,7 @@ def restore_database_from_cloud(app_module=None, force_seed: bool = False) -> bo
             if isinstance(hist, list) and not app_module._smart_reassign_history:
                 app_module._smart_reassign_history.extend(hist[:30])
 
-        global _last_resolve_audit_bundle, _last_auto_resolver_pool
+        global _last_resolve_audit_bundle, _last_auto_resolver_pool, _last_pending_summary
         existing_audit = cloud_data.get("resolve_audit")
         if existing_audit and isinstance(existing_audit, dict) and existing_audit.get("data"):
             _last_resolve_audit_bundle = existing_audit
@@ -234,6 +235,10 @@ def restore_database_from_cloud(app_module=None, force_seed: bool = False) -> bo
         existing_ar = cloud_data.get("auto_resolver_pool")
         if existing_ar and isinstance(existing_ar, dict) and existing_ar.get("items"):
             _last_auto_resolver_pool = existing_ar
+
+        existing_ps = cloud_data.get("pending_summary")
+        if existing_ps and isinstance(existing_ps, dict) and existing_ps.get("labels"):
+            _last_pending_summary = existing_ps
 
         _last_applied_ui_ts = int(cloud_data.get("ui_updated_at") or 0)
         logger.info(f"☁️ Restored state from Hugging Face Cloud Dataset ({len(cloud_agents)} agents).")
@@ -408,7 +413,7 @@ def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Syn
     Builds a fresh snapshot of SQLite + live Chatwoot delays/scores and commits
     it to ar7222/chatwoot-smart-router-db (data.json).
     """
-    global _last_resolve_audit_bundle, _last_resolve_audit_ts, _last_auto_resolver_pool, _last_auto_resolver_ts
+    global _last_resolve_audit_bundle, _last_resolve_audit_ts, _last_auto_resolver_pool, _last_auto_resolver_ts, _last_pending_summary
     if not _sync_lock.acquire(blocking=False):
         return False
 
@@ -489,9 +494,11 @@ def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Syn
 
         try:
             pending_summary = app_module._fetch_pending_summary(force_refresh=False)
+            if isinstance(pending_summary, dict) and pending_summary.get("labels"):
+                _last_pending_summary = pending_summary
         except Exception as e:
             logger.warning(f"⚠️ Cloud sync pending_summary warning: {e}")
-            pending_summary = {"success": True, "total_unassigned_pending": 0, "labels": []}
+            pending_summary = _last_pending_summary or {"success": True, "total_unassigned_pending": 0, "labels": []}
 
         selected_in_shift = [
             a for a in enriched_agents if a.get("is_selected") and not a.get("is_paused") and a.get("in_shift")

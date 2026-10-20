@@ -25,6 +25,8 @@ CLOUD_COMMIT_URL = f"https://huggingface.co/api/datasets/{HF_USER}/{DATASET_NAME
 _sync_lock = threading.Lock()
 _last_applied_ui_ts = 0
 _last_seen_local_server_ts = 0
+_last_resolve_audit_bundle = None
+_last_resolve_audit_ts = 0
 
 
 def is_local_server_active() -> bool:
@@ -222,6 +224,11 @@ def restore_database_from_cloud(app_module=None, force_seed: bool = False) -> bo
             if isinstance(hist, list) and not app_module._smart_reassign_history:
                 app_module._smart_reassign_history.extend(hist[:30])
 
+        global _last_resolve_audit_bundle
+        existing_audit = cloud_data.get("resolve_audit")
+        if existing_audit and isinstance(existing_audit, dict) and existing_audit.get("data"):
+            _last_resolve_audit_bundle = existing_audit
+
         _last_applied_ui_ts = int(cloud_data.get("ui_updated_at") or 0)
         logger.info(f"☁️ Restored state from Hugging Face Cloud Dataset ({len(cloud_agents)} agents).")
         return True
@@ -298,11 +305,12 @@ def poll_and_apply_cloud_ui_changes(app_module) -> bool:
     return True
 
 
-def export_and_push_to_cloud(app_module, num_pages: int = 8, summary: str = "Sync live Chatwoot router state", is_local_server: bool = False) -> bool:
+def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Sync live Chatwoot router state", is_local_server: bool = False) -> bool:
     """
     Builds a fresh snapshot of SQLite + live Chatwoot delays/scores and commits
     it to ar7222/chatwoot-smart-router-db (data.json).
     """
+    global _last_resolve_audit_bundle, _last_resolve_audit_ts
     if not _sync_lock.acquire(blocking=False):
         return False
 
@@ -401,33 +409,55 @@ def export_and_push_to_cloud(app_module, num_pages: int = 8, summary: str = "Syn
             "worker_heartbeat": datetime.now(CAIRO_TZ).strftime("%Y-%m-%d %I:%M:%S %p")
         }
 
-        resolve_audit_payload = None
-        try:
-            cache_dict = getattr(app_module, "_resolve_audit_cache", {})
-            if cache_dict:
-                latest_entry = max(cache_dict.values(), key=lambda x: x.get("timestamp", 0))
-                resolve_audit_payload = latest_entry.get("payload")
-        except Exception:
-            pass
-        if not resolve_audit_payload:
-            resolve_audit_payload = {
-                "summary": {
-                    "date": datetime.now(CAIRO_TZ).strftime("%Y-%m-%d"),
-                    "total_routed": sum(today_counts.values()),
-                    "total_resolved": 0,
-                    "total_open": 0,
-                    "total_violations": 0,
-                    "total_after_shift_resolves": 0,
-                    "total_unanswered_inquiries": 0,
-                    "total_no_reply": 0,
-                    "total_compliant": 0,
-                    "resolution_rate": 0,
-                    "compliance_rate": 100,
-                    "audited_at": datetime.now(CAIRO_TZ).strftime("%I:%M %p")
+        now_ts = time.time()
+        has_valid_audit = (
+            isinstance(_last_resolve_audit_bundle, dict)
+            and isinstance(_last_resolve_audit_bundle.get("data"), dict)
+            and len((_last_resolve_audit_bundle.get("data") or {}).get("agents") or []) > 0
+        )
+        if not has_valid_audit or (now_ts - _last_resolve_audit_ts >= 600):
+            try:
+                audit_today = app_module.audit_conversations_for_agents(date_str="today", source="chatwoot")
+                audit_yesterday = app_module.audit_conversations_for_agents(date_str="yesterday", source="chatwoot")
+                audit_2days = app_module.audit_conversations_for_agents(date_str="2days", source="chatwoot")
+                audit_sys_today = app_module.audit_conversations_for_agents(date_str="today", source="system")
+                _last_resolve_audit_bundle = {
+                    "success": True,
+                    "data": audit_today,
+                    "ranges": {
+                        "chatwoot_today": audit_today,
+                        "chatwoot_yesterday": audit_yesterday,
+                        "chatwoot_2days": audit_2days,
+                        "system_today": audit_sys_today
+                    }
+                }
+                _last_resolve_audit_ts = now_ts
+            except Exception as e:
+                logger.warning(f"⚠️ Cloud sync resolve_audit refresh warning: {e}")
+
+        if not _last_resolve_audit_bundle:
+            _last_resolve_audit_bundle = {
+                "success": True,
+                "data": {
+                    "summary": {
+                        "date": datetime.now(CAIRO_TZ).strftime("%Y-%m-%d"),
+                        "total_routed": sum(today_counts.values()),
+                        "total_resolved": 0,
+                        "total_open": 0,
+                        "total_violations": 0,
+                        "total_after_shift_resolves": 0,
+                        "total_unanswered_inquiries": 0,
+                        "total_no_reply": 0,
+                        "total_compliant": 0,
+                        "resolution_rate": 0,
+                        "compliance_rate": 100,
+                        "audited_at": datetime.now(CAIRO_TZ).strftime("%I:%M %p")
+                    },
+                    "agents": [],
+                    "all_violations": [],
+                    "all_after_shift": []
                 },
-                "agents": [],
-                "all_violations": [],
-                "all_after_shift": []
+                "ranges": {}
             }
 
         cloud_data = {
@@ -448,10 +478,7 @@ def export_and_push_to_cloud(app_module, num_pages: int = 8, summary: str = "Syn
             },
             "delays_report": delays_report,
             "pending_summary": pending_summary,
-            "resolve_audit": {
-                "success": True,
-                "data": resolve_audit_payload
-            }
+            "resolve_audit": _last_resolve_audit_bundle
         }
 
         json_bytes = json.dumps(cloud_data, ensure_ascii=False).encode("utf-8")

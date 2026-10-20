@@ -589,7 +589,7 @@ def _periodic_cloud_sync_loop():
             if ui_changed or _cloud_push_event.is_set() or (time.time() - last_push_ts >= 120):
                 _cloud_push_event.clear()
                 last_push_ts = time.time()
-                hf_sync.export_and_push_to_cloud(sys.modules[__name__], num_pages=8, is_local_server=True)
+                hf_sync.export_and_push_to_cloud(sys.modules[__name__], num_pages=0, is_local_server=True)
         except Exception as e:
             logger.error(f"❌ Cloud sync thread error: {e}")
         _cloud_push_event.wait(timeout=30)

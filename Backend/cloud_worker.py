@@ -104,7 +104,7 @@ def run_cloud_worker():
         try:
             if needs_push or (time.time() - last_cloud_push_ts >= 120):
                 last_cloud_push_ts = time.time()
-                hf_sync.export_and_push_to_cloud(router_app, num_pages=8)
+                hf_sync.export_and_push_to_cloud(router_app, num_pages=0)
         except Exception as e:
             logger.error(f"❌ Cloud dataset push error: {e}")
 

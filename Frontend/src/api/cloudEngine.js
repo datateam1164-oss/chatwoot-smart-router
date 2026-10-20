@@ -835,10 +835,42 @@ export async function handleCloudApi(endpoint, options = {}) {
   }
 
   if (pathOnly === '/reports/resolve-audit') {
-    const rawAudit = db.resolve_audit?.data || db.resolve_audit || {};
+    const startD = params.get('startDate') || params.get('date') || body.startDate || body.date || '';
+    const endD = params.get('endDate') || body.endDate || startD;
+    const src = (params.get('source') || body.source || 'chatwoot').toLowerCase();
+    const targetAgentId = params.get('agent_id') || body.agent_id || null;
+
+    const todayIso = new Date().toISOString().slice(0, 10);
+    const yestDate = new Date();
+    yestDate.setDate(yestDate.getDate() - 1);
+    const yesterdayIso = yestDate.toISOString().slice(0, 10);
+
+    const ranges = db.resolve_audit?.ranges || {};
+    let selectedPayload = db.resolve_audit?.data || db.resolve_audit || {};
+
+    if (src === 'system' && ranges.system_today) {
+      selectedPayload = ranges.system_today;
+    } else if (startD && endD && startD !== endD && ranges.chatwoot_2days) {
+      selectedPayload = ranges.chatwoot_2days;
+    } else if ((startD === yesterdayIso || startD === 'yesterday') && ranges.chatwoot_yesterday) {
+      selectedPayload = ranges.chatwoot_yesterday;
+    } else if (ranges.chatwoot_today) {
+      selectedPayload = ranges.chatwoot_today;
+    }
+
+    let agentsList = Array.isArray(selectedPayload.agents) ? selectedPayload.agents : [];
+    let violationsList = Array.isArray(selectedPayload.all_violations) ? selectedPayload.all_violations : [];
+    let afterShiftList = Array.isArray(selectedPayload.all_after_shift) ? selectedPayload.all_after_shift : [];
+
+    if (targetAgentId) {
+      agentsList = agentsList.filter(a => String(a.agent_id) === String(targetAgentId));
+      violationsList = violationsList.filter(c => String(c.agent_id) === String(targetAgentId));
+      afterShiftList = afterShiftList.filter(c => String(c.agent_id) === String(targetAgentId));
+    }
+
     const normalizedAudit = {
       summary: {
-        date: new Date().toISOString().slice(0, 10),
+        date: startD || todayIso,
         total_routed: 0,
         total_resolved: 0,
         total_open: 0,
@@ -850,11 +882,11 @@ export async function handleCloudApi(endpoint, options = {}) {
         resolution_rate: 0,
         compliance_rate: 100,
         audited_at: new Date().toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' }),
-        ...(rawAudit.summary || {})
+        ...(selectedPayload.summary || {})
       },
-      agents: Array.isArray(rawAudit.agents) ? rawAudit.agents : [],
-      all_violations: Array.isArray(rawAudit.all_violations) ? rawAudit.all_violations : [],
-      all_after_shift: Array.isArray(rawAudit.all_after_shift) ? rawAudit.all_after_shift : []
+      agents: agentsList,
+      all_violations: violationsList,
+      all_after_shift: afterShiftList
     };
     return {
       success: true,

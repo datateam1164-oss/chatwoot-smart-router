@@ -370,6 +370,12 @@ def poll_and_apply_cloud_ui_changes(app_module) -> bool:
                 cids = payload.get("conversation_ids") or []
                 resolved_cnt = _execute_bulk_resolve_in_chatwoot(app_module, cids)
                 logger.info(f"☁️ Executed cloud command 'auto_resolver_execute': resolved={resolved_cnt}/{len(cids)}")
+            elif action == "reopen_pending":
+                lbl = str(payload.get("label") or "").strip()
+                cnt = int(payload.get("count") or 10)
+                if lbl:
+                    ok, reopened_cnt, msg = app_module._reopen_pending_conversations(lbl, cnt)
+                    logger.info(f"☁️ Executed cloud command 'reopen_pending' ({lbl}, {cnt}): ok={ok}, reopened={reopened_cnt}")
         except Exception as e:
             logger.error(f"❌ Cloud command '{action}' execution error: {e}")
 
@@ -482,9 +488,10 @@ def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Syn
             }
 
         try:
-            pending_summary = app_module._get_pending_conversations_summary(force=False)
-        except Exception:
-            pending_summary = {"total_pending": 0, "by_label": {}, "labels_list": []}
+            pending_summary = app_module._fetch_pending_summary(force_refresh=False)
+        except Exception as e:
+            logger.warning(f"⚠️ Cloud sync pending_summary warning: {e}")
+            pending_summary = {"success": True, "total_unassigned_pending": 0, "labels": []}
 
         selected_in_shift = [
             a for a in enriched_agents if a.get("is_selected") and not a.get("is_paused") and a.get("in_shift")

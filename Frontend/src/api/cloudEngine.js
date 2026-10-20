@@ -822,11 +822,45 @@ export async function handleCloudApi(endpoint, options = {}) {
 
   // ── Pending Summary, CRM Sync, Resolve Audit, Auto Resolver ──
   if (pathOnly === '/pending-conversations/summary') {
-    return db.pending_summary || { total_pending: 0, by_label: {}, labels_list: [] };
+    const ps = db.pending_summary || {};
+    return {
+      success: true,
+      total_unassigned_pending: Number(ps.total_unassigned_pending ?? ps.total_pending ?? 0),
+      labels: Array.isArray(ps.labels) ? ps.labels : (Array.isArray(ps.labels_list) ? ps.labels_list : []),
+      timestamp: ps.timestamp || new Date().toISOString()
+    };
   }
 
   if (pathOnly === '/pending-conversations/reopen' && method === 'POST') {
-    return { success: true, reopened_count: 0 };
+    const label = String(body.label || '').trim();
+    const reqCount = Math.max(1, Number(body.count || 10));
+    let actualReopened = reqCount;
+
+    if (db.pending_summary && Array.isArray(db.pending_summary.labels)) {
+      const targetLbl = db.pending_summary.labels.find(
+        l => String(l.label || '').toLowerCase() === label.toLowerCase() || String(l.title || '').toLowerCase() === label.toLowerCase()
+      );
+      if (targetLbl) {
+        const avail = Number(targetLbl.pending_count || 0);
+        actualReopened = avail > 0 ? Math.min(avail, reqCount) : reqCount;
+        targetLbl.pending_count = Math.max(0, avail - actualReopened);
+        db.pending_summary.total_unassigned_pending = Math.max(
+          0,
+          Number(db.pending_summary.total_unassigned_pending || 0) - actualReopened
+        );
+      }
+    }
+
+    await saveCloudDatabase(db, `Reopen ${actualReopened} pending chats for ${label}`, {
+      action: 'reopen_pending',
+      payload: { label, count: reqCount }
+    });
+    return {
+      success: true,
+      reopened_count: actualReopened,
+      label,
+      message: `تمت إعادة فتح ${actualReopened} محادثة للتصنيف '${label}' وإرسالها للتوزيع.`
+    };
   }
 
   if (pathOnly === '/crm/sync' && method === 'POST') {

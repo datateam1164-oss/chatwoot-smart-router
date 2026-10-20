@@ -27,6 +27,8 @@ _last_applied_ui_ts = 0
 _last_seen_local_server_ts = 0
 _last_resolve_audit_bundle = None
 _last_resolve_audit_ts = 0
+_last_auto_resolver_pool = None
+_last_auto_resolver_ts = 0
 
 
 def is_local_server_active() -> bool:
@@ -224,10 +226,14 @@ def restore_database_from_cloud(app_module=None, force_seed: bool = False) -> bo
             if isinstance(hist, list) and not app_module._smart_reassign_history:
                 app_module._smart_reassign_history.extend(hist[:30])
 
-        global _last_resolve_audit_bundle
+        global _last_resolve_audit_bundle, _last_auto_resolver_pool
         existing_audit = cloud_data.get("resolve_audit")
         if existing_audit and isinstance(existing_audit, dict) and existing_audit.get("data"):
             _last_resolve_audit_bundle = existing_audit
+
+        existing_ar = cloud_data.get("auto_resolver_pool")
+        if existing_ar and isinstance(existing_ar, dict) and existing_ar.get("items"):
+            _last_auto_resolver_pool = existing_ar
 
         _last_applied_ui_ts = int(cloud_data.get("ui_updated_at") or 0)
         logger.info(f"☁️ Restored state from Hugging Face Cloud Dataset ({len(cloud_agents)} agents).")
@@ -235,6 +241,67 @@ def restore_database_from_cloud(app_module=None, force_seed: bool = False) -> bo
     except Exception as e:
         logger.error(f"❌ Error restoring DB from cloud: {e}")
         return False
+
+
+def _execute_bulk_resolve_in_chatwoot(app_module, conv_ids: list) -> int:
+    if not conv_ids:
+        return 0
+    base_url, _, account_id = app_module.get_cw_config()
+    headers = app_module._cw_headers()
+    resolved = 0
+    for cid in conv_ids:
+        url = f"{base_url}/api/v1/accounts/{account_id}/conversations/{cid}/toggle_status"
+        try:
+            r = requests.post(url, json={"status": "resolved"}, headers=headers, timeout=15)
+            if r.status_code in (200, 201):
+                resolved += 1
+            time.sleep(0.08)
+        except Exception as e:
+            logger.warning(f"⚠️ Error resolving conv {cid}: {e}")
+    return resolved
+
+
+def _build_auto_resolver_pool(app_module, max_pages: int = 20, min_hours: float = 24.0) -> dict:
+    raw_convs = app_module._fetch_conversations_for_resolver(target_status="both", max_pages=max_pages, sort_order="asc")
+    now_ts = int(time.time())
+    min_seconds = min_hours * 3600
+    base_url, _, account_id = app_module.get_cw_config()
+    items = []
+    for c in raw_convs:
+        cid = str(c.get("id", ""))
+        if not cid:
+            continue
+        act_ts = int(c.get("last_activity_at") or c.get("updated_at") or c.get("created_at") or 0)
+        if not act_ts:
+            continue
+        diff_sec = now_ts - act_ts
+        if diff_sec < min_seconds:
+            continue
+        diff_hours = round(diff_sec / 3600.0, 1)
+        diff_days = round(diff_hours / 24.0, 1)
+        meta = c.get("meta") or {}
+        sender = meta.get("sender") or {}
+        assignee = meta.get("assignee") or {}
+        last_msg = (c.get("last_non_activity_message") or {}).get("content") or ""
+        items.append({
+            "id": cid,
+            "status": str(c.get("status", "pending")).lower(),
+            "labels": c.get("labels") or [],
+            "inactive_hours": diff_hours,
+            "inactive_days": diff_days,
+            "last_activity_timestamp": act_ts,
+            "sender_name": sender.get("name") or sender.get("identifier") or "Unknown",
+            "sender_phone": sender.get("phone_number") or "",
+            "assignee_name": assignee.get("name") or "Unassigned",
+            "last_message": last_msg[:90],
+            "chatwoot_url": f"{base_url}/app/accounts/{account_id}/conversations/{cid}"
+        })
+    items.sort(key=lambda x: x["inactive_hours"], reverse=True)
+    return {
+        "total_scanned": len(raw_convs),
+        "updated_at": datetime.now(CAIRO_TZ).strftime("%Y-%m-%d %I:%M:%S %p"),
+        "items": items[:1200]
+    }
 
 
 def poll_and_apply_cloud_ui_changes(app_module) -> bool:
@@ -299,6 +366,10 @@ def poll_and_apply_cloud_ui_changes(app_module) -> bool:
                 import crm_service
                 crm_service.sync_shifts_to_database()
                 logger.info("☁️ Executed cloud command 'crm_sync'")
+            elif action == "auto_resolver_execute":
+                cids = payload.get("conversation_ids") or []
+                resolved_cnt = _execute_bulk_resolve_in_chatwoot(app_module, cids)
+                logger.info(f"☁️ Executed cloud command 'auto_resolver_execute': resolved={resolved_cnt}/{len(cids)}")
         except Exception as e:
             logger.error(f"❌ Cloud command '{action}' execution error: {e}")
 
@@ -331,7 +402,7 @@ def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Syn
     Builds a fresh snapshot of SQLite + live Chatwoot delays/scores and commits
     it to ar7222/chatwoot-smart-router-db (data.json).
     """
-    global _last_resolve_audit_bundle, _last_resolve_audit_ts
+    global _last_resolve_audit_bundle, _last_resolve_audit_ts, _last_auto_resolver_pool, _last_auto_resolver_ts
     if not _sync_lock.acquire(blocking=False):
         return False
 
@@ -480,6 +551,19 @@ def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Syn
                 "ranges": {}
             }
 
+        has_valid_ar = (
+            isinstance(_last_auto_resolver_pool, dict)
+            and isinstance(_last_auto_resolver_pool.get("items"), list)
+        )
+        if not has_valid_ar or (now_ts - _last_auto_resolver_ts >= 600):
+            try:
+                _last_auto_resolver_pool = _build_auto_resolver_pool(app_module, max_pages=20, min_hours=24.0)
+                _last_auto_resolver_ts = now_ts
+            except Exception as e:
+                logger.warning(f"⚠️ Cloud sync auto_resolver_pool warning: {e}")
+        if not _last_auto_resolver_pool:
+            _last_auto_resolver_pool = {"total_scanned": 0, "updated_at": "", "items": []}
+
         cloud_data = {
             "version": 1,
             "updated_at": datetime.now(CAIRO_TZ).strftime("%Y-%m-%d %H:%M:%S"),
@@ -498,7 +582,8 @@ def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Syn
             },
             "delays_report": delays_report,
             "pending_summary": pending_summary,
-            "resolve_audit": _last_resolve_audit_bundle
+            "resolve_audit": _last_resolve_audit_bundle,
+            "auto_resolver_pool": _last_auto_resolver_pool
         }
 
         json_bytes = json.dumps(cloud_data, ensure_ascii=False).encode("utf-8")

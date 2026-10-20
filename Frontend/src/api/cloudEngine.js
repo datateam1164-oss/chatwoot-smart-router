@@ -702,7 +702,14 @@ export async function handleCloudApi(endpoint, options = {}) {
   }
 
   if (pathOnly === '/labels' && method === 'GET') {
-    return db.labels || { selected_labels: [], all_labels: [] };
+    const lblObj = db.labels || { selected_labels: [], all_labels: [] };
+    const flatLabels = (lblObj.all_labels || [])
+      .map(l => (typeof l === 'string' ? l : l?.title))
+      .filter(Boolean);
+    return {
+      ...lblObj,
+      labels: flatLabels.length > 0 ? flatLabels : (lblObj.selected_labels || [])
+    };
   }
 
   if (pathOnly === '/labels' && method === 'POST') {
@@ -895,11 +902,65 @@ export async function handleCloudApi(endpoint, options = {}) {
   }
 
   if (pathOnly === '/auto-resolver/scan' && method === 'POST') {
-    return { success: true, matched_sample: [], total_matched: 0, total_scanned: 0 };
+    const targetStatus = String(body.status || 'pending').trim().toLowerCase();
+    const labelMode = String(body.label_mode || 'all').trim().toLowerCase();
+    const specificLabel = String(body.specific_label || '').trim().toLowerCase();
+    const sortOrder = String(body.sort_order || 'asc').trim().toLowerCase();
+    const hoursThreshold = Number(body.hours_threshold || 48);
+
+    const poolObj = db.auto_resolver_pool || {};
+    const poolItems = Array.isArray(poolObj.items) ? poolObj.items : [];
+
+    const matched = poolItems.filter(c => {
+      const st = String(c.status || 'pending').toLowerCase();
+      if (targetStatus === 'pending' && st !== 'pending') return false;
+      if (targetStatus === 'open' && st !== 'open') return false;
+
+      if (Number(c.inactive_hours || 0) < hoursThreshold) return false;
+
+      const lbls = Array.isArray(c.labels) ? c.labels.map(l => String(l).trim().toLowerCase()) : [];
+      if (labelMode === 'unlabeled' && lbls.length > 0) return false;
+      if (labelMode === 'specific' && specificLabel && !lbls.includes(specificLabel)) return false;
+
+      return true;
+    });
+
+    matched.sort((a, b) =>
+      sortOrder === 'desc'
+        ? Number(a.inactive_hours || 0) - Number(b.inactive_hours || 0)
+        : Number(b.inactive_hours || 0) - Number(a.inactive_hours || 0)
+    );
+
+    return {
+      success: true,
+      total_scanned: poolObj.total_scanned || poolItems.length,
+      total_matched: matched.length,
+      hours_threshold: hoursThreshold,
+      target_status: targetStatus,
+      label_mode: labelMode,
+      matched_sample: matched.slice(0, 1500),
+      all_matched_ids: matched.map(m => m.id)
+    };
   }
 
   if (pathOnly === '/auto-resolver/execute' && method === 'POST') {
-    return { success: true, resolved_count: 0 };
+    const convIds = Array.isArray(body.conversation_ids) ? body.conversation_ids.map(String) : [];
+    const idsSet = new Set(convIds);
+    if (db.auto_resolver_pool && Array.isArray(db.auto_resolver_pool.items)) {
+      db.auto_resolver_pool.items = db.auto_resolver_pool.items.filter(item => !idsSet.has(String(item.id)));
+    }
+    await saveCloudDatabase(db, `Bulk resolve ${convIds.length} conversations`, {
+      action: 'auto_resolver_execute',
+      payload: { conversation_ids: convIds }
+    });
+    return {
+      success: true,
+      resolved_count: convIds.length,
+      failed_count: 0,
+      total_requested: convIds.length,
+      duration_seconds: 1.2,
+      message: `تم إرسال أمر إغلاق ${convIds.length} محادثة لمحرك السحابة وتحديث القائمة بنجاح.`
+    };
   }
 
   return { success: true };

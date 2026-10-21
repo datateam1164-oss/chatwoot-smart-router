@@ -191,7 +191,7 @@ def sync_shifts_to_database():
             ag_id = str(matched_cw.get("id"))
             ag_name = matched_cw.get("name")
             
-            # Save or update agent in DB
+            # Save or update agent shift in DB (never force is_selected=1 if supervisor deselected them)
             database.upsert_agent({
                 "id": ag_id,
                 "name": ag_name,
@@ -201,7 +201,7 @@ def sync_shifts_to_database():
                 "shift_text": shift_disp,
                 "team": "Sales",
                 "coordinator_name": coordinator_name or None,
-                "is_selected": 1 if working else 0
+                "is_selected": None if working else 0
             })
             synced_count += 1
             matched_results.append({
@@ -210,24 +210,6 @@ def sync_shifts_to_database():
                 "shift": shift_disp,
                 "working": working
             })
-
-    # Ensure any Sales agent with a valid working shift today (who wasn't manually deselected today) is selected
-    try:
-        today_date = now.strftime("%Y-%m-%d")
-        conn = database.get_db()
-        conn.execute("""
-            UPDATE agents
-            SET is_selected = 1
-            WHERE team = 'Sales'
-              AND shift_start IS NOT NULL
-              AND shift_end IS NOT NULL
-              AND LOWER(COALESCE(shift_text, '')) NOT IN ('weekend', 'off', 'اجازة', 'إجازة')
-              AND (manual_selected_date IS NULL OR manual_selected_date != ?)
-        """, (today_date,))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.warning(f"⚠️ Auto-select active shift agents warning: {e}")
 
     database.set_setting("crm_last_sync", now.isoformat())
     logger.info(f"✅ CRM Sync completed: {synced_count} sales agents updated with today's shifts.")

@@ -43,26 +43,12 @@ def run_cloud_worker():
     # 1. Seed SQLite from Hugging Face Cloud Dataset (ar7222/chatwoot-smart-router-db)
     hf_sync.restore_database_from_cloud(router_app, force_seed=True)
 
-    # 2. Refresh Chatwoot teams & agents and sync CRM shifts
+    # 2. Refresh Chatwoot teams & agents (without modifying is_selected or shifts)
     try:
         router_app._refresh_team_cache()
         router_app.sync_chatwoot_agents_to_db()
     except Exception as e:
         logger.warning(f"⚠️ Initial Chatwoot agent sync warning: {e}")
-
-    try:
-        settings = database.get_settings()
-        if settings.get("crm_email") and settings.get("crm_password"):
-            crm_service.sync_shifts_to_database()
-    except Exception as e:
-        logger.warning(f"⚠️ Initial CRM shift sync warning: {e}")
-
-    # Process any pending commands and push initial synced state immediately (<1s)
-    try:
-        hf_sync.poll_and_apply_cloud_ui_changes(router_app)
-        hf_sync.export_and_push_to_cloud(router_app, fast_only=True, summary="Initial worker startup & CRM shift sync")
-    except Exception as e:
-        logger.warning(f"⚠️ Initial fast cloud push warning: {e}")
 
     # Start non-blocking background thread for heavy reports (delays, pending counts, resolve audit)
     bg_thread = threading.Thread(target=_heavy_reports_sync_loop, daemon=True)

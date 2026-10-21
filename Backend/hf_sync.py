@@ -28,6 +28,7 @@ _sync_lock = threading.Lock()
 _last_applied_ui_ts = 0
 _last_applied_cmd_ts = 0
 _applied_cmd_ids = set()
+_needs_heavy_push = False
 _last_seen_local_server_ts = 0
 _last_resolve_audit_bundle = None
 _last_resolve_audit_ts = 0
@@ -250,7 +251,7 @@ def restore_database_from_cloud(app_module=None, force_seed: bool = False) -> bo
             if isinstance(hist, list) and not app_module._smart_reassign_history:
                 app_module._smart_reassign_history.extend(hist[:30])
 
-        global _last_resolve_audit_bundle, _last_resolve_audit_ts, _last_auto_resolver_pool, _last_auto_resolver_ts, _last_pending_summary, _last_delays_report, _last_cw_labels
+        global _last_resolve_audit_bundle, _last_resolve_audit_ts, _last_auto_resolver_pool, _last_auto_resolver_ts, _last_pending_summary, _last_delays_report, _last_cw_labels, _needs_heavy_push
         existing_audit = cloud_data.get("resolve_audit")
         if existing_audit and isinstance(existing_audit, dict) and existing_audit.get("data"):
             _last_resolve_audit_bundle = existing_audit
@@ -286,22 +287,38 @@ def restore_database_from_cloud(app_module=None, force_seed: bool = False) -> bo
 def _execute_bulk_resolve_in_chatwoot(app_module, conv_ids: list) -> int:
     if not conv_ids:
         return 0
+    import concurrent.futures
     base_url, _, account_id = app_module.get_cw_config()
     headers = app_module._cw_headers()
-    resolved = 0
-    for cid in conv_ids:
+
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=1)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update(headers)
+
+    def _resolve_one(cid):
         url = f"{base_url}/api/v1/accounts/{account_id}/conversations/{cid}/toggle_status"
-        try:
-            r = requests.post(url, json={"status": "resolved"}, headers=headers, timeout=15)
-            if r.status_code in (200, 201):
-                resolved += 1
-            time.sleep(0.08)
-        except Exception as e:
-            logger.warning(f"⚠️ Error resolving conv {cid}: {e}")
-    return resolved
+        for attempt in range(2):
+            try:
+                r = session.post(url, json={"status": "resolved"}, timeout=15)
+                if r.status_code in (200, 201):
+                    return True
+                if r.status_code == 429:
+                    time.sleep(0.8)
+            except Exception as e:
+                if attempt == 0:
+                    time.sleep(0.4)
+                    continue
+                logger.warning(f"⚠️ Error resolving conv {cid}: {e}")
+        return False
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(_resolve_one, conv_ids))
+    return sum(1 for ok in results if ok)
 
 
-def _build_auto_resolver_pool(app_module, max_pages: int = 20, min_hours: float = 24.0) -> dict:
+def _build_auto_resolver_pool(app_module, max_pages: int = 30, min_hours: float = 0.0) -> dict:
     raw_convs = app_module._fetch_conversations_for_resolver(target_status="both", max_pages=max_pages, sort_order="asc")
     now_ts = int(time.time())
     min_seconds = min_hours * 3600
@@ -314,7 +331,7 @@ def _build_auto_resolver_pool(app_module, max_pages: int = 20, min_hours: float 
         act_ts = int(c.get("last_activity_at") or c.get("updated_at") or c.get("created_at") or 0)
         if not act_ts:
             continue
-        diff_sec = now_ts - act_ts
+        diff_sec = max(0, now_ts - act_ts)
         if diff_sec < min_seconds:
             continue
         diff_hours = round(diff_sec / 3600.0, 1)
@@ -340,7 +357,7 @@ def _build_auto_resolver_pool(app_module, max_pages: int = 20, min_hours: float 
     return {
         "total_scanned": len(raw_convs),
         "updated_at": datetime.now(CAIRO_TZ).strftime("%Y-%m-%d %I:%M:%S %p"),
-        "items": items[:1200]
+        "items": items[:1600]
     }
 
 
@@ -351,7 +368,7 @@ def poll_and_apply_cloud_ui_changes(app_module) -> bool:
     Applies them to SQLite and executes live Chatwoot commands immediately.
     Returns True if any change or command was processed.
     """
-    global _last_applied_ui_ts, _last_applied_cmd_ts, _applied_cmd_ids, _last_seen_local_server_ts, _last_delays_report
+    global _last_applied_ui_ts, _last_applied_cmd_ts, _applied_cmd_ids, _needs_heavy_push, _last_seen_local_server_ts, _last_delays_report, _last_auto_resolver_pool, _last_resolve_audit_bundle, _last_resolve_audit_ts
     fast_cmds = fetch_cloud_commands()
     new_fast_cmds = [
         c for c in fast_cmds
@@ -380,7 +397,8 @@ def poll_and_apply_cloud_ui_changes(app_module) -> bool:
     if ui_ts > _last_applied_ui_ts:
         action_only_types = {
             "set_routing", "run_cycle", "smart_reassign", "unassign_conv", "pull_agent_chats",
-            "crm_sync", "auto_resolver_execute", "reopen_pending", "refresh_pending", "refresh_cw_counts"
+            "crm_sync", "auto_resolver_execute", "reopen_pending", "refresh_pending", "refresh_cw_counts",
+            "refresh_delays", "refresh_resolve_audit"
         }
         has_non_action = (len(legacy_cmds) == 0) or any(
             isinstance(c, dict) and c.get("action") not in action_only_types for c in legacy_cmds
@@ -457,8 +475,22 @@ def poll_and_apply_cloud_ui_changes(app_module) -> bool:
                 crm_service.sync_shifts_to_database()
                 logger.info("☁️ Executed cloud command 'crm_sync'")
             elif action == "auto_resolver_execute":
-                cids = payload.get("conversation_ids") or []
+                cids = [str(x) for x in (payload.get("conversation_ids") or []) if x]
                 resolved_cnt = _execute_bulk_resolve_in_chatwoot(app_module, cids)
+                if _last_auto_resolver_pool and isinstance(_last_auto_resolver_pool.get("items"), list):
+                    cids_set = set(cids)
+                    _last_auto_resolver_pool["items"] = [
+                        it for it in _last_auto_resolver_pool["items"]
+                        if str(it.get("id")) not in cids_set
+                    ]
+                    _last_auto_resolver_pool["updated_at"] = datetime.now(CAIRO_TZ).strftime("%Y-%m-%d %I:%M:%S %p")
+                if _last_delays_report and isinstance(_last_delays_report, dict):
+                    cids_set = set(cids)
+                    _last_delays_report["pending_chats"] = [
+                        ch for ch in (_last_delays_report.get("pending_chats") or [])
+                        if str(ch.get("conv_id")) not in cids_set
+                    ]
+                _needs_heavy_push = True
                 logger.info(f"☁️ Executed cloud command 'auto_resolver_execute': resolved={resolved_cnt}/{len(cids)}")
             elif action == "reopen_pending":
                 lbl = str(payload.get("label") or "").strip()
@@ -489,6 +521,31 @@ def poll_and_apply_cloud_ui_changes(app_module) -> bool:
                     logger.info(f"☁️ Executed cloud command 'refresh_cw_counts' ({len(counts)} agents)")
                 except Exception as cw_err:
                     logger.warning(f"⚠️ refresh_cw_counts warning: {cw_err}")
+            elif action == "refresh_delays":
+                try:
+                    pgs = int(payload.get("pages") or 0)
+                    fresh_d = app_module._build_delays_report(num_pages=pgs)
+                    if isinstance(fresh_d, dict) and fresh_d.get("summary"):
+                        _last_delays_report = fresh_d
+                    logger.info("☁️ Executed cloud command 'refresh_delays'")
+                except Exception as rd_err:
+                    logger.warning(f"⚠️ refresh_delays warning: {rd_err}")
+            elif action == "refresh_resolve_audit":
+                try:
+                    audit_today = _compact_audit_payload(app_module.audit_conversations_for_agents(date_str="today", source="chatwoot"))
+                    audit_sys_today = _compact_audit_payload(app_module.audit_conversations_for_agents(date_str="today", source="system"))
+                    existing_ranges = (_last_resolve_audit_bundle or {}).get("ranges") or {}
+                    existing_ranges["system_today"] = audit_sys_today
+                    _last_resolve_audit_bundle = {
+                        "success": True,
+                        "data": audit_today,
+                        "ranges": existing_ranges
+                    }
+                    _last_resolve_audit_ts = time.time()
+                    _needs_heavy_push = True
+                    logger.info("☁️ Executed cloud command 'refresh_resolve_audit'")
+                except Exception as ra_err:
+                    logger.warning(f"⚠️ refresh_resolve_audit warning: {ra_err}")
         except Exception as e:
             logger.error(f"❌ Cloud command '{action}' execution error: {e}")
 
@@ -524,7 +581,7 @@ def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Syn
     Slow Chatwoot network calls run OUTSIDE _sync_lock and BEFORE reading SQLite
     settings/agents so user actions (Start/Stop/Select) are NEVER blocked or overwritten.
     """
-    global _last_resolve_audit_bundle, _last_resolve_audit_ts, _last_auto_resolver_pool, _last_auto_resolver_ts, _last_pending_summary, _last_delays_report, _last_cw_labels
+    global _last_resolve_audit_bundle, _last_resolve_audit_ts, _last_auto_resolver_pool, _last_auto_resolver_ts, _last_pending_summary, _last_delays_report, _last_cw_labels, _needs_heavy_push
 
     # 1. Perform slow Chatwoot network calls OUTSIDE _sync_lock so fast commands never wait or get dropped
     if not fast_only:
@@ -602,7 +659,7 @@ def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Syn
         )
         if not has_valid_ar or (now_ts - _last_auto_resolver_ts >= 900):
             try:
-                _last_auto_resolver_pool = _build_auto_resolver_pool(app_module, max_pages=20, min_hours=24.0)
+                _last_auto_resolver_pool = _build_auto_resolver_pool(app_module, max_pages=30, min_hours=0.0)
                 _last_auto_resolver_ts = now_ts
             except Exception as e:
                 logger.warning(f"⚠️ Cloud sync auto_resolver_pool warning: {e}")
@@ -783,7 +840,9 @@ def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Syn
             cmd_clear_bytes = json.dumps({"commands": [], "cleared_at": int(time.time() * 1000)}).encode("utf-8")
             b64_cmd = base64.b64encode(cmd_clear_bytes).decode("ascii")
             lines.append(json.dumps({"key": "file", "value": {"content": b64_cmd, "path": "commands.json", "encoding": "base64"}}))
-        else:
+
+        if not fast_only or _needs_heavy_push:
+            _needs_heavy_push = False
             heavy_payload = {
                 "updated_at": datetime.now(CAIRO_TZ).strftime("%Y-%m-%d %H:%M:%S"),
                 "resolve_audit": _last_resolve_audit_bundle,

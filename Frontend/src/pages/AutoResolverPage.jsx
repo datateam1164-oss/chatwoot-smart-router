@@ -173,7 +173,7 @@ export default function AutoResolverPage() {
 
     const targets = [...modalTargetIds];
     const total = targets.length;
-    const BATCH_SIZE = 30; // Safe batch size to prevent server timeout or Puma thread saturation
+    const BATCH_SIZE = 500; // Send up to 500 IDs per cloud command to avoid rapid Git commit collisions
     let totalResolved = 0;
     let totalFailed = 0;
 

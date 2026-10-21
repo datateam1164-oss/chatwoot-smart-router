@@ -41,16 +41,36 @@ let _optimisticRoutingState = null;
 let _optimisticRoutingUntil = 0;
 let _optimisticAgentOverrides = {};
 let _recentCommandsQueue = [];
+const _optimisticResolvedIds = new Set();
+const _optimisticUnassignedConvIds = new Set();
+
+function pinAgentOverride(aid, patch, durationMs = 35000) {
+  const key = String(aid);
+  const existing = _optimisticAgentOverrides[key]?.patch || {};
+  _optimisticAgentOverrides[key] = {
+    until: Date.now() + durationMs,
+    patch: { ...existing, ...patch }
+  };
+}
+
+function filterResolvedFromPool(poolObj) {
+  if (!poolObj || !Array.isArray(poolObj.items) || _optimisticResolvedIds.size === 0) return poolObj;
+  poolObj.items = poolObj.items.filter(item => !_optimisticResolvedIds.has(String(item.id)));
+  return poolObj;
+}
 
 async function ensureHeavyReportsLoaded(db, forceRefresh = false) {
   const now = Date.now();
   const hasAudit = Array.isArray(db?.resolve_audit?.data?.agents) && db.resolve_audit.data.agents.length > 0;
   const hasAr = Array.isArray(db?.auto_resolver_pool?.items) && db.auto_resolver_pool.items.length > 0;
-  if (!forceRefresh && hasAudit && hasAr) return db;
+  if (!forceRefresh && hasAudit && hasAr) {
+    filterResolvedFromPool(db.auto_resolver_pool);
+    return db;
+  }
 
   if (!forceRefresh && _heavyReportsCache && (now - _heavyReportsCacheTs < 60000)) {
     db.resolve_audit = _heavyReportsCache.resolve_audit || db.resolve_audit;
-    db.auto_resolver_pool = _heavyReportsCache.auto_resolver_pool || db.auto_resolver_pool;
+    db.auto_resolver_pool = filterResolvedFromPool(_heavyReportsCache.auto_resolver_pool || db.auto_resolver_pool);
     return db;
   }
 
@@ -61,6 +81,7 @@ async function ensureHeavyReportsLoaded(db, forceRefresh = false) {
     });
     if (res.ok) {
       const heavy = await res.json();
+      if (heavy.auto_resolver_pool) filterResolvedFromPool(heavy.auto_resolver_pool);
       _heavyReportsCache = heavy;
       _heavyReportsCacheTs = now;
       if (heavy.resolve_audit) db.resolve_audit = heavy.resolve_audit;
@@ -76,7 +97,9 @@ async function ensureHeavyReportsLoaded(db, forceRefresh = false) {
     }
     if (_staticBundleCache) {
       if (!hasAudit && _staticBundleCache.resolve_audit) db.resolve_audit = _staticBundleCache.resolve_audit;
-      if (!hasAr && _staticBundleCache.auto_resolver_pool) db.auto_resolver_pool = _staticBundleCache.auto_resolver_pool;
+      if (!hasAr && _staticBundleCache.auto_resolver_pool) {
+        db.auto_resolver_pool = filterResolvedFromPool(_staticBundleCache.auto_resolver_pool);
+      }
     }
   } catch (_) {}
 
@@ -720,6 +743,7 @@ export async function handleCloudApi(endpoint, options = {}) {
     const ag = (db.agents || []).find(a => String(a.id) === String(aid));
     if (ag) {
       ag.is_selected = body.is_selected ? 1 : 0;
+      pinAgentOverride(aid, { is_selected: ag.is_selected });
       recomputeStatus(db);
       await saveCloudDatabase(db, `Toggle select agent #${aid}`);
     }
@@ -731,9 +755,13 @@ export async function handleCloudApi(endpoint, options = {}) {
     const idsSet = Array.isArray(body.agent_ids) ? new Set(body.agent_ids.map(String)) : null;
     (db.agents || []).forEach(ag => {
       if (idsSet) {
-        if (idsSet.has(String(ag.id))) ag.is_selected = isSel;
+        if (idsSet.has(String(ag.id))) {
+          ag.is_selected = isSel;
+          pinAgentOverride(ag.id, { is_selected: isSel });
+        }
       } else if (!body.team || body.team === 'all' || ag.team === body.team) {
         ag.is_selected = isSel;
+        pinAgentOverride(ag.id, { is_selected: isSel });
       }
     });
     recomputeStatus(db);
@@ -747,6 +775,7 @@ export async function handleCloudApi(endpoint, options = {}) {
     const ag = (db.agents || []).find(a => String(a.id) === String(aid));
     if (ag) {
       ag.is_paused = body.is_paused ? 1 : 0;
+      pinAgentOverride(aid, { is_paused: ag.is_paused });
       recomputeStatus(db);
       await saveCloudDatabase(db, `Toggle pause agent #${aid}`);
     }
@@ -759,6 +788,7 @@ export async function handleCloudApi(endpoint, options = {}) {
     const ag = (db.agents || []).find(a => String(a.id) === String(aid));
     if (ag) {
       ag.chat_limit = Number(body.limit || 10);
+      pinAgentOverride(aid, { chat_limit: ag.chat_limit });
       await saveCloudDatabase(db, `Update 30m limit for agent #${aid}`);
     }
     return { success: true };
@@ -769,9 +799,13 @@ export async function handleCloudApi(endpoint, options = {}) {
     const idsSet = Array.isArray(body.agent_ids) ? new Set(body.agent_ids.map(String)) : null;
     (db.agents || []).forEach(ag => {
       if (idsSet) {
-        if (idsSet.has(String(ag.id))) ag.chat_limit = lim;
+        if (idsSet.has(String(ag.id))) {
+          ag.chat_limit = lim;
+          pinAgentOverride(ag.id, { chat_limit: lim });
+        }
       } else if (!body.team || body.team === 'all' || ag.team === body.team) {
         ag.chat_limit = lim;
+        pinAgentOverride(ag.id, { chat_limit: lim });
       }
     });
     await saveCloudDatabase(db, `Bulk update 30m limit to ${lim}`);
@@ -784,6 +818,7 @@ export async function handleCloudApi(endpoint, options = {}) {
     const ag = (db.agents || []).find(a => String(a.id) === String(aid));
     if (ag) {
       ag.daily_chat_limit = Number(body.daily_limit || 100);
+      pinAgentOverride(aid, { daily_chat_limit: ag.daily_chat_limit });
       await saveCloudDatabase(db, `Update daily limit for agent #${aid}`);
     }
     return { success: true };
@@ -794,9 +829,13 @@ export async function handleCloudApi(endpoint, options = {}) {
     const idsSet = Array.isArray(body.agent_ids) ? new Set(body.agent_ids.map(String)) : null;
     (db.agents || []).forEach(ag => {
       if (idsSet) {
-        if (idsSet.has(String(ag.id))) ag.daily_chat_limit = dLim;
+        if (idsSet.has(String(ag.id))) {
+          ag.daily_chat_limit = dLim;
+          pinAgentOverride(ag.id, { daily_chat_limit: dLim });
+        }
       } else if (!body.team || body.team === 'all' || ag.team === body.team) {
         ag.daily_chat_limit = dLim;
+        pinAgentOverride(ag.id, { daily_chat_limit: dLim });
       }
     });
     await saveCloudDatabase(db, `Bulk update daily limit to ${dLim}`);
@@ -809,6 +848,7 @@ export async function handleCloudApi(endpoint, options = {}) {
     const ag = (db.agents || []).find(a => String(a.id) === String(aid));
     if (ag) {
       ag.assigned_labels = Array.isArray(body.labels) ? body.labels : [];
+      pinAgentOverride(aid, { assigned_labels: ag.assigned_labels });
       await saveCloudDatabase(db, `Update assigned labels for agent #${aid}`);
     }
     return { success: true };
@@ -823,6 +863,12 @@ export async function handleCloudApi(endpoint, options = {}) {
       ag.shift_end = Number(body.shift_end);
       ag.shift_text = body.shift_text || `${body.shift_start} - ${body.shift_end}`;
       ag.is_manual_shift = 1;
+      pinAgentOverride(aid, {
+        shift_start: ag.shift_start,
+        shift_end: ag.shift_end,
+        shift_text: ag.shift_text,
+        is_manual_shift: 1
+      });
       recomputeStatus(db);
       await saveCloudDatabase(db, `Update manual shift for agent #${aid}`);
     }
@@ -838,6 +884,12 @@ export async function handleCloudApi(endpoint, options = {}) {
       ag.shift_end = ag.crm_shift_end ?? ag.shift_end;
       ag.shift_text = ag.crm_shift_text || ag.shift_text;
       ag.is_manual_shift = 0;
+      pinAgentOverride(aid, {
+        shift_start: ag.shift_start,
+        shift_end: ag.shift_end,
+        shift_text: ag.shift_text,
+        is_manual_shift: 0
+      });
       recomputeStatus(db);
       await saveCloudDatabase(db, `Reset shift to CRM for agent #${aid}`);
     }
@@ -850,6 +902,7 @@ export async function handleCloudApi(endpoint, options = {}) {
     (db.agents || []).forEach(ag => {
       if (idsSet.has(String(ag.id))) {
         ag.assigned_labels = lbls;
+        pinAgentOverride(ag.id, { assigned_labels: lbls });
       }
     });
     await saveCloudDatabase(db, 'Apply label preset to agents');
@@ -865,6 +918,7 @@ export async function handleCloudApi(endpoint, options = {}) {
       const isUnassigned = !agCoord || agCoord === 'none' || agCoord === 'بدون كوردينيتور';
       if ((coord === '__unassigned__' && isUnassigned) || agCoord === coord) {
         ag.assigned_labels = lbls;
+        pinAgentOverride(ag.id, { assigned_labels: lbls });
         affected++;
       }
     });
@@ -1053,13 +1107,24 @@ export async function handleCloudApi(endpoint, options = {}) {
 
   // ── Delays Report & Smart Reassignment ──
   if (pathOnly === '/reports/delays' && method === 'GET') {
-    return db.delays_report || {
+    const isForce = params.get('refresh') === 'true' || params.get('force') === 'true';
+    if (isForce) {
+      saveCloudDatabase(db, 'Refresh delays report from Chatwoot', {
+        action: 'refresh_delays',
+        payload: { pages: Number(params.get('pages') || 0) }
+      }).catch(() => {});
+    }
+    const rep = db.delays_report || {
       success: true,
       summary: {},
       pending_chats: [],
       agents_summary: [],
       configured_sales_labels: db.labels?.selected_labels || []
     };
+    if (Array.isArray(rep.pending_chats) && _optimisticUnassignedConvIds.size > 0) {
+      rep.pending_chats = rep.pending_chats.filter(c => !_optimisticUnassignedConvIds.has(String(c.conv_id)));
+    }
+    return rep;
   }
 
   if (pathOnly === '/reports/smart-reassign/config' && method === 'GET') {
@@ -1108,14 +1173,34 @@ export async function handleCloudApi(endpoint, options = {}) {
 
   const unassignConvMatch = pathOnly.match(/^\/conversations\/([^/]+)\/unassign$/);
   if (unassignConvMatch && method === 'POST') {
-    const cid = unassignConvMatch[1];
+    const cid = String(unassignConvMatch[1]);
+    const aid = body?.agent_id ? String(body.agent_id) : null;
+    _optimisticUnassignedConvIds.add(cid);
     if (db.delays_report && Array.isArray(db.delays_report.pending_chats)) {
-      db.delays_report.pending_chats = db.delays_report.pending_chats.filter(c => String(c.conv_id) !== String(cid));
-      await saveCloudDatabase(db, `Unassign conversation #${cid}`, {
-        action: 'unassign_conv',
-        payload: { conv_id: cid, agent_id: body?.agent_id }
-      });
+      db.delays_report.pending_chats = db.delays_report.pending_chats.filter(c => String(c.conv_id) !== cid);
     }
+    if (aid) {
+      const ag = (db.agents || []).find(a => String(a.id) === aid);
+      if (ag) {
+        const nextOpen = Math.max(0, Number(ag.chatwoot_open_chats || ag.active_chats || 0) - 1);
+        const nextWin = Math.max(0, Number(ag.current_window_chats || 0) - 1);
+        const nextPulled = Number(ag.pulled_today_count || 0) + 1;
+        ag.active_chats = nextOpen;
+        ag.chatwoot_open_chats = nextOpen;
+        ag.current_window_chats = nextWin;
+        ag.pulled_today_count = nextPulled;
+        pinAgentOverride(aid, {
+          active_chats: nextOpen,
+          chatwoot_open_chats: nextOpen,
+          current_window_chats: nextWin,
+          pulled_today_count: nextPulled
+        });
+      }
+    }
+    await saveCloudDatabase(db, `Unassign conversation #${cid}`, {
+      action: 'unassign_conv',
+      payload: { conv_id: cid, agent_id: aid }
+    });
     return { success: true };
   }
 
@@ -1201,7 +1286,17 @@ export async function handleCloudApi(endpoint, options = {}) {
   }
 
   if (pathOnly === '/reports/resolve-audit') {
-    await ensureHeavyReportsLoaded(db, params.get('refresh') === 'true' || params.get('force') === 'true');
+    const isForce =
+      params.get('refresh') === 'true' ||
+      params.get('force') === 'true' ||
+      params.get('force_refresh') === 'true';
+    if (isForce) {
+      saveCloudDatabase(db, 'Refresh resolve audit report', {
+        action: 'refresh_resolve_audit',
+        payload: {}
+      }).catch(() => {});
+    }
+    await ensureHeavyReportsLoaded(db, isForce);
     const startD = params.get('startDate') || params.get('date') || body.startDate || body.date || '';
     const endD = params.get('endDate') || body.endDate || startD;
     const src = (params.get('source') || body.source || 'chatwoot').toLowerCase();
@@ -1270,7 +1365,9 @@ export async function handleCloudApi(endpoint, options = {}) {
     const hoursThreshold = Number(body.hours_threshold || 48);
 
     const poolObj = db.auto_resolver_pool || {};
-    const poolItems = Array.isArray(poolObj.items) ? poolObj.items : [];
+    const poolItems = Array.isArray(poolObj.items)
+      ? poolObj.items.filter(c => !_optimisticResolvedIds.has(String(c.id)))
+      : [];
 
     const matched = poolItems.filter(c => {
       const st = String(c.status || 'pending').toLowerCase();
@@ -1306,9 +1403,14 @@ export async function handleCloudApi(endpoint, options = {}) {
 
   if (pathOnly === '/auto-resolver/execute' && method === 'POST') {
     const convIds = Array.isArray(body.conversation_ids) ? body.conversation_ids.map(String) : [];
-    const idsSet = new Set(convIds);
+    convIds.forEach(id => _optimisticResolvedIds.add(id));
     if (db.auto_resolver_pool && Array.isArray(db.auto_resolver_pool.items)) {
-      db.auto_resolver_pool.items = db.auto_resolver_pool.items.filter(item => !idsSet.has(String(item.id)));
+      db.auto_resolver_pool.items = db.auto_resolver_pool.items.filter(item => !_optimisticResolvedIds.has(String(item.id)));
+    }
+    if (_heavyReportsCache?.auto_resolver_pool?.items) {
+      _heavyReportsCache.auto_resolver_pool.items = _heavyReportsCache.auto_resolver_pool.items.filter(
+        item => !_optimisticResolvedIds.has(String(item.id))
+      );
     }
     await saveCloudDatabase(db, `Bulk resolve ${convIds.length} conversations`, {
       action: 'auto_resolver_execute',

@@ -27,6 +27,7 @@ CLOUD_COMMIT_URL = f"https://huggingface.co/api/datasets/{HF_USER}/{DATASET_NAME
 _sync_lock = threading.Lock()
 _last_applied_ui_ts = 0
 _last_applied_cmd_ts = 0
+_applied_cmd_ids = set()
 _last_seen_local_server_ts = 0
 _last_resolve_audit_bundle = None
 _last_resolve_audit_ts = 0
@@ -350,11 +351,11 @@ def poll_and_apply_cloud_ui_changes(app_module) -> bool:
     Applies them to SQLite and executes live Chatwoot commands immediately.
     Returns True if any change or command was processed.
     """
-    global _last_applied_ui_ts, _last_applied_cmd_ts, _last_seen_local_server_ts
+    global _last_applied_ui_ts, _last_applied_cmd_ts, _applied_cmd_ids, _last_seen_local_server_ts, _last_delays_report
     fast_cmds = fetch_cloud_commands()
     new_fast_cmds = [
         c for c in fast_cmds
-        if isinstance(c, dict) and int(c.get("ts") or 0) > _last_applied_cmd_ts
+        if isinstance(c, dict) and (c.get("id") or str(c.get("ts") or 0)) not in _applied_cmd_ids and int(c.get("ts") or 0) > 0
     ]
 
     cloud_data = fetch_cloud_database()
@@ -368,7 +369,7 @@ def poll_and_apply_cloud_ui_changes(app_module) -> bool:
     ui_ts = int(cloud_data.get("ui_updated_at") or 0)
     legacy_cmds = [
         c for c in (cloud_data.get("pending_commands") or [])
-        if isinstance(c, dict) and int(c.get("ts") or 0) > _last_applied_cmd_ts
+        if isinstance(c, dict) and (c.get("id") or str(c.get("ts") or 0)) not in _applied_cmd_ids and int(c.get("ts") or 0) > _last_applied_cmd_ts
     ]
     pending_cmds = new_fast_cmds + legacy_cmds
 
@@ -389,7 +390,11 @@ def poll_and_apply_cloud_ui_changes(app_module) -> bool:
         _last_applied_ui_ts = max(_last_applied_ui_ts, ui_ts)
 
     for c in pending_cmds:
+        cid_key = c.get("id") or str(c.get("ts") or 0)
+        _applied_cmd_ids.add(cid_key)
         _last_applied_cmd_ts = max(_last_applied_cmd_ts, int(c.get("ts") or 0))
+    if len(_applied_cmd_ids) > 1000:
+        _applied_cmd_ids.clear()
 
     for cmd in pending_cmds:
         if not isinstance(cmd, dict):
@@ -422,19 +427,30 @@ def poll_and_apply_cloud_ui_changes(app_module) -> bool:
                     database.mark_chats_as_pulled([str(cid)])
                     if aid:
                         database.decrement_agent_window_chats(str(aid), 1)
+                        with app_module._agent_report_lock:
+                            cur_open = int(app_module._agent_report_cache.get(str(aid), 0) or 0)
+                            app_module._agent_report_cache[str(aid)] = max(0, cur_open - 1)
+                        database.update_agent_active_chats(str(aid), max(0, cur_open - 1))
+                    if _last_delays_report and isinstance(_last_delays_report, dict):
+                        _last_delays_report["pending_chats"] = [
+                            ch for ch in (_last_delays_report.get("pending_chats") or [])
+                            if str(ch.get("conv_id")) != str(cid)
+                        ]
                     logger.info(f"☁️ Executed cloud command 'unassign_conv' for #{cid}")
             elif action == "pull_agent_chats":
                 aid = payload.get("agent_id")
+                max_cnt = payload.get("max_count")
                 if aid:
-                    convs = app_module._fetch_agent_open_conversations(aid)
-                    pulled_ids = []
-                    for c in convs:
-                        cid = c.get("id")
-                        if cid and app_module.unassign_conversation_in_chatwoot(cid):
-                            pulled_ids.append(str(cid))
-                    if pulled_ids:
-                        database.mark_chats_as_pulled(pulled_ids)
-                        database.decrement_agent_window_chats(str(aid), len(pulled_ids))
+                    pulled_ids = app_module._pull_agent_open_chats(aid, max_count=max_cnt)
+                    if _last_delays_report and isinstance(_last_delays_report, dict):
+                        pulled_set = set(str(x) for x in pulled_ids)
+                        _last_delays_report["pending_chats"] = [
+                            ch for ch in (_last_delays_report.get("pending_chats") or [])
+                            if str(ch.get("agent_id")) != str(aid) and str(ch.get("conv_id")) not in pulled_set
+                        ]
+                        for as_item in (_last_delays_report.get("agents_summary") or []):
+                            if str(as_item.get("agent_id")) == str(aid):
+                                as_item["open_chats_count"] = max(0, int(as_item.get("open_chats_count") or 0) - len(pulled_ids))
                     logger.info(f"☁️ Executed cloud command 'pull_agent_chats' for agent {aid}: pulled={len(pulled_ids)}")
             elif action == "crm_sync":
                 import crm_service

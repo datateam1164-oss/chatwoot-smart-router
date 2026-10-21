@@ -1008,14 +1008,48 @@ def api_update_team_labels():
         "message": f"تم بنجاح تحديث تصنيفات التيم ({affected} موظف)"
     })
 
-@app.route('/api/agents/<agent_id>/pull-chats', methods=['POST'])
-def api_pull_chats(agent_id):
+def _fetch_agent_open_conversations(agent_id, max_pages: int = 3) -> list:
+    """Fetches all currently open conversations assigned to agent_id in Chatwoot using filter endpoint + fallback."""
+    base_url, _, account_id = get_cw_config()
+    aid_int = int(agent_id)
+    found = {}
+
+    for pg in range(1, max_pages + 1):
+        try:
+            r = requests.post(
+                f"{base_url}/api/v1/accounts/{account_id}/conversations/filter?page={pg}",
+                json={
+                    "payload": [
+                        {"attribute_key": "status", "filter_operator": "equal_to", "values": ["open"], "query_operator": "and"},
+                        {"attribute_key": "assignee_id", "filter_operator": "equal_to", "values": [aid_int], "query_operator": None}
+                    ]
+                },
+                headers=_cw_headers(),
+                timeout=10
+            )
+            if r.status_code == 200:
+                payload = r.json().get("payload") or []
+                for c in payload:
+                    cid = str(c.get("id") or "")
+                    if cid:
+                        found[cid] = c
+                if len(payload) < 25:
+                    break
+            else:
+                break
+        except Exception as e:
+            logger.warning(f"⚠️ _fetch_agent_open_conversations filter page {pg} warning: {e}")
+            break
+
+    return list(found.values())
+
+
+def _pull_agent_open_chats(agent_id, max_count=None) -> list:
     """
-    Pulls open conversations assigned to this agent in Chatwoot and unassigns them.
-    Supports max_count from request payload to pull a specific number of chats.
+    Finds all open conversations assigned to agent_id (via Chatwoot filter + chats_log fallback),
+    unassigns them in parallel in Chatwoot, and updates SQLite + in-memory caches.
+    Returns list of pulled conversation ID strings.
     """
-    data = request.json or {}
-    max_count = data.get("max_count")
     try:
         max_count = int(max_count) if max_count is not None and str(max_count).strip() != "" else None
         if max_count is not None and max_count <= 0:
@@ -1024,44 +1058,33 @@ def api_pull_chats(agent_id):
         max_count = None
 
     base_url, _, account_id = get_cw_config()
-    
-    # 1. Get candidate conversation IDs from chats_log
+    aid_int = int(agent_id)
+
+    # 1. Direct filter from Chatwoot (already verified status == open & assignee_id == aid_int)
+    verified_open_cids = []
+    for c in _fetch_agent_open_conversations(agent_id):
+        cid = str(c.get("id") or "")
+        if cid and cid not in verified_open_cids:
+            verified_open_cids.append(cid)
+
+    # 2. Also check candidate conversation IDs from chats_log in case filter missed any
     conn = database.get_db()
     cursor = conn.cursor()
     cursor.execute("""
         SELECT DISTINCT conv_id FROM chats_log 
-        WHERE agent_id = ? 
+        WHERE agent_id = ? AND status = 'assigned'
         ORDER BY id DESC LIMIT 50
     """, (str(agent_id),))
-    candidate_cids = [r["conv_id"] for r in cursor.fetchall()]
+    log_cids = [str(r["conv_id"]) for r in cursor.fetchall() if str(r["conv_id"]) not in verified_open_cids]
     conn.close()
 
-    # 2. Also check open assigned conversations from Chatwoot directly
-    try:
-        cw_res = requests.get(
-            f"{base_url}/api/v1/accounts/{account_id}/conversations",
-            params={"status": "open", "assignee_type": "assigned"},
-            headers=_cw_headers(),
-            timeout=8
-        )
-        if cw_res.status_code == 200:
-            cw_payload = cw_res.json().get("data", {}).get("payload", [])
-            for c in cw_payload:
-                aid = (c.get("meta", {}) or {}).get("assignee", {}).get("id")
-                cid = str(c.get("id", ""))
-                if aid == int(agent_id) and cid and cid not in candidate_cids:
-                    candidate_cids.append(cid)
-    except Exception as e:
-        logger.warning(f"⚠️ Could not scan open assigned convs from CW: {e}")
+    target_verified = verified_open_cids[:max_count] if max_count else verified_open_cids
 
-    if not candidate_cids:
-        return jsonify({
-            "success": True,
-            "unassigned_count": 0,
-            "message": "لا توجد محادثات مفتوحة مسجلة لهذا الموظف لسحبها."
-        })
+    def unassign_direct(cid):
+        if unassign_conversation_in_chatwoot(cid):
+            return str(cid)
+        return None
 
-    # 3. Check candidate conversations in parallel to verify which ones are currently open & assigned to this agent
     def check_and_unassign(cid):
         try:
             r = requests.get(f"{base_url}/api/v1/accounts/{account_id}/conversations/{cid}", headers=_cw_headers(), timeout=6)
@@ -1069,31 +1092,59 @@ def api_pull_chats(agent_id):
                 c = r.json()
                 aid = (c.get("meta", {}) or {}).get("assignee", {}).get("id")
                 status = c.get("status")
-                if aid == int(agent_id) and status == "open":
+                if aid == aid_int and status == "open":
                     if unassign_conversation_in_chatwoot(cid):
-                        return cid
+                        return str(cid)
         except Exception as err:
             logger.error(f"❌ Error unassigning conv {cid}: {err}")
         return None
 
     pulled_cids = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(check_and_unassign, cid) for cid in candidate_cids]
-        for future in concurrent.futures.as_completed(futures):
-            res_cid = future.result()
-            if res_cid:
-                pulled_cids.append(res_cid)
-                if max_count and len(pulled_cids) >= max_count:
-                    break
+    if target_verified:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            for res_cid in executor.map(unassign_direct, target_verified):
+                if res_cid:
+                    pulled_cids.append(res_cid)
+
+    remaining_needed = (max_count - len(pulled_cids)) if max_count else None
+    if log_cids and (remaining_needed is None or remaining_needed > 0):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(check_and_unassign, cid) for cid in log_cids]
+            for future in concurrent.futures.as_completed(futures):
+                res_cid = future.result()
+                if res_cid and res_cid not in pulled_cids:
+                    pulled_cids.append(res_cid)
+                    if max_count and len(pulled_cids) >= max_count:
+                        break
 
     unassigned_count = len(pulled_cids)
     if unassigned_count > 0:
-        database.decrement_agent_window_chats(agent_id, unassigned_count)
+        database.decrement_agent_window_chats(str(agent_id), unassigned_count)
         database.mark_chats_as_pulled(pulled_cids)
+        with _agent_report_lock:
+            cur_open = int(_agent_report_cache.get(str(agent_id), 0) or 0)
+            new_open = max(0, cur_open - unassigned_count)
+            _agent_report_cache[str(agent_id)] = new_open
+        database.update_agent_active_chats(str(agent_id), new_open)
         with assigned_lock:
             for cid in pulled_cids:
                 recently_assigned_convs.pop(str(cid), None)
         logger.info(f"🔄 Successfully pulled {unassigned_count} chats from agent ID {agent_id}: {pulled_cids}")
+
+    return pulled_cids
+
+
+@app.route('/api/agents/<agent_id>/pull-chats', methods=['POST'])
+def api_pull_chats(agent_id):
+    """
+    Pulls open conversations assigned to this agent in Chatwoot and unassigns them.
+    Supports max_count from request payload to pull a specific number of chats.
+    """
+    data = request.json or {}
+    max_count = data.get("max_count")
+    pulled_cids = _pull_agent_open_chats(agent_id, max_count=max_count)
+    unassigned_count = len(pulled_cids)
+    if unassigned_count > 0:
         return jsonify({
             "success": True,
             "unassigned_count": unassigned_count,

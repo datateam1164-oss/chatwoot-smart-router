@@ -39,6 +39,8 @@ let _optimisticPendingSummary = null;
 let _optimisticPendingUntil = 0;
 let _optimisticRoutingState = null;
 let _optimisticRoutingUntil = 0;
+let _optimisticAgentOverrides = {};
+let _recentCommandsQueue = [];
 
 async function ensureHeavyReportsLoaded(db, forceRefresh = false) {
   const now = Date.now();
@@ -133,11 +135,18 @@ async function hydrateMissingFromStaticBundle(data) {
     }
   });
   if (Array.isArray(data.agents)) {
+    const nowTs = Date.now();
     data.agents.forEach(a => {
+      const aidStr = String(a.id);
+      const ov = _optimisticAgentOverrides[aidStr];
+      if (ov && nowTs < ov.until) {
+        Object.assign(a, ov.patch);
+        return;
+      }
       const openCnt = Math.max(
         Number(a.chatwoot_open_chats || 0),
         Number(a.active_chats || 0),
-        delaysOpenMap[String(a.id)] || 0
+        delaysOpenMap[aidStr] || 0
       );
       a.active_chats = openCnt;
       a.chatwoot_open_chats = openCnt;
@@ -250,13 +259,23 @@ export async function loadCloudDatabase(forceRefresh = false) {
 
 export async function saveCloudDatabase(dbData, summaryMessage = 'Update cloud database', pendingCommand = null) {
   // Fast Path (<100ms): When firing an action command (reopen_pending, run_cycle, refresh_pending, etc.),
-  // commit ONLY a tiny 150-byte commands.json file instead of uploading the full database!
+  // commit ONLY a tiny commands.json file instead of uploading the full database!
   if (pendingCommand) {
     _cloudCache = dbData;
     _cloudCacheTs = Date.now();
+    const nowTs = Date.now();
+    const cmdEntry = {
+      ...pendingCommand,
+      id: `${nowTs}_${Math.random().toString(36).slice(2, 7)}`,
+      ts: nowTs
+    };
+    _recentCommandsQueue = [
+      ..._recentCommandsQueue.filter(c => nowTs - c.ts < 25000),
+      cmdEntry
+    ];
     const cmdPayload = {
-      commands: [{ ...pendingCommand, ts: Date.now() }],
-      updated_at: Date.now()
+      commands: _recentCommandsQueue,
+      updated_at: nowTs
     };
     const b64Cmd = utf8ToBase64(JSON.stringify(cmdPayload));
     const headerLine = JSON.stringify({ key: 'header', value: { summary: summaryMessage } });
@@ -881,16 +900,60 @@ export async function handleCloudApi(endpoint, options = {}) {
 
   const pullChatsMatch = pathOnly.match(/^\/agents\/([^/]+)\/pull-chats$/);
   if (pullChatsMatch && method === 'POST') {
-    const aid = pullChatsMatch[1];
+    const aid = String(pullChatsMatch[1]);
+    const maxCount = body?.max_count ? Number(body.max_count) : null;
     const rep = db.delays_report || {};
     const before = (rep.pending_chats || []).length;
-    rep.pending_chats = (rep.pending_chats || []).filter(c => String(c.agent_id) !== String(aid));
-    const pulled = before - rep.pending_chats.length;
+    rep.pending_chats = (rep.pending_chats || []).filter(c => String(c.agent_id) !== aid);
+    const pulledFromDelays = before - rep.pending_chats.length;
+
+    const ag = (db.agents || []).find(a => String(a.id) === aid);
+    const currentOpen = Math.max(
+      Number(ag?.chatwoot_open_chats || 0),
+      Number(ag?.active_chats || 0),
+      Number(ag?.current_window_chats || 0),
+      pulledFromDelays
+    );
+    const pulledCount = maxCount && maxCount > 0 ? Math.min(maxCount, Math.max(1, currentOpen)) : Math.max(1, currentOpen);
+
+    if (ag) {
+      const nextOpen = Math.max(0, Number(ag.chatwoot_open_chats || ag.active_chats || 0) - pulledCount);
+      const nextWin = Math.max(0, Number(ag.current_window_chats || 0) - pulledCount);
+      const nextPulled = Number(ag.pulled_today_count || 0) + pulledCount;
+      ag.active_chats = nextOpen;
+      ag.chatwoot_open_chats = nextOpen;
+      ag.current_window_chats = nextWin;
+      ag.pulled_today_count = nextPulled;
+      _optimisticAgentOverrides[aid] = {
+        until: Date.now() + 25000,
+        patch: {
+          active_chats: nextOpen,
+          chatwoot_open_chats: nextOpen,
+          current_window_chats: nextWin,
+          pulled_today_count: nextPulled
+        }
+      };
+    }
+
+    if (Array.isArray(rep.agents_summary)) {
+      rep.agents_summary.forEach(as => {
+        if (String(as.agent_id) === aid) {
+          as.open_chats_count = Math.max(0, Number(as.open_chats_count || 0) - pulledCount);
+        }
+      });
+    }
+
+    recomputeStatus(db);
     await saveCloudDatabase(db, `Pull chats from agent #${aid}`, {
       action: 'pull_agent_chats',
-      payload: { agent_id: aid }
+      payload: { agent_id: aid, max_count: maxCount }
     });
-    return { success: true, pulled_count: pulled };
+    return {
+      success: true,
+      unassigned_count: pulledCount,
+      pulled_count: pulledCount,
+      message: `تم بنجاح سحب ${pulledCount} محادثة من الموظف وإعادتها لقائمة الانتظار في شات ووت (بدون إسناد لموظف آخر).`
+    };
   }
 
   // ── Settings, Mappings, Logs, Labels, Routing Controls ──

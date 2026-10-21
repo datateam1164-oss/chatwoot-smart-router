@@ -20,10 +20,13 @@ CAIRO_TZ = pytz.timezone("Africa/Cairo")
 HF_USER = "ar7222"
 DATASET_NAME = "chatwoot-smart-router-db"
 CLOUD_DATA_URL = f"https://huggingface.co/datasets/{HF_USER}/{DATASET_NAME}/resolve/main/data.json"
+CLOUD_COMMANDS_URL = f"https://huggingface.co/datasets/{HF_USER}/{DATASET_NAME}/resolve/main/commands.json"
+CLOUD_HEAVY_URL = f"https://huggingface.co/datasets/{HF_USER}/{DATASET_NAME}/resolve/main/reports_heavy.json"
 CLOUD_COMMIT_URL = f"https://huggingface.co/api/datasets/{HF_USER}/{DATASET_NAME}/commit/main"
 
 _sync_lock = threading.Lock()
 _last_applied_ui_ts = 0
+_last_applied_cmd_ts = 0
 _last_seen_local_server_ts = 0
 _last_resolve_audit_bundle = None
 _last_resolve_audit_ts = 0
@@ -53,13 +56,30 @@ def fetch_cloud_database() -> dict | None:
         res = requests.get(
             f"{CLOUD_DATA_URL}?t={int(time.time() * 1000)}",
             headers={"Authorization": f"Bearer {tok}", "Cache-Control": "no-cache"},
-            timeout=20
+            timeout=15
         )
         if res.status_code == 200:
             return res.json()
     except Exception as e:
         logger.warning(f"⚠️ Cloud dataset fetch error: {e}")
     return None
+
+
+def fetch_cloud_commands() -> list:
+    tok = get_hf_token()
+    try:
+        res = requests.get(
+            f"{CLOUD_COMMANDS_URL}?t={int(time.time() * 1000)}",
+            headers={"Authorization": f"Bearer {tok}", "Cache-Control": "no-cache"},
+            timeout=8
+        )
+        if res.status_code == 200:
+            data = res.json()
+            if isinstance(data, dict):
+                return data.get("commands") or []
+    except Exception:
+        pass
+    return []
 
 
 def restore_database_from_cloud(app_module=None, force_seed: bool = False) -> bool:
@@ -326,33 +346,50 @@ def _build_auto_resolver_pool(app_module, max_pages: int = 20, min_hours: float 
 def poll_and_apply_cloud_ui_changes(app_module) -> bool:
     """
     Checks if the user modified settings, agents, or triggered any live command
-    from the Static Space UI (`ui_updated_at` / `pending_commands`).
+    from the Static Space UI (`commands.json` / `ui_updated_at` / `pending_commands`).
     Applies them to SQLite and executes live Chatwoot commands immediately.
     Returns True if any change or command was processed.
     """
-    global _last_applied_ui_ts, _last_seen_local_server_ts
+    global _last_applied_ui_ts, _last_applied_cmd_ts, _last_seen_local_server_ts
+    fast_cmds = fetch_cloud_commands()
+    new_fast_cmds = [
+        c for c in fast_cmds
+        if isinstance(c, dict) and int(c.get("ts") or 0) > _last_applied_cmd_ts
+    ]
+
     cloud_data = fetch_cloud_database()
     if not cloud_data or not isinstance(cloud_data, dict):
-        return False
+        if not new_fast_cmds:
+            return False
+        cloud_data = {}
 
-    _last_seen_local_server_ts = float(cloud_data.get("local_server_active_ts") or 0)
+    if cloud_data:
+        _last_seen_local_server_ts = float(cloud_data.get("local_server_active_ts") or 0)
     ui_ts = int(cloud_data.get("ui_updated_at") or 0)
-    pending_cmds = cloud_data.get("pending_commands") or []
+    legacy_cmds = [
+        c for c in (cloud_data.get("pending_commands") or [])
+        if isinstance(c, dict) and int(c.get("ts") or 0) > _last_applied_cmd_ts
+    ]
+    pending_cmds = new_fast_cmds + legacy_cmds
 
     if ui_ts <= _last_applied_ui_ts and not pending_cmds:
         return False
 
     logger.info(f"☁️ Detected Cloud UI update (ui_ts={ui_ts}, commands={len(pending_cmds)}). Applying...")
-    action_only_types = {
-        "run_cycle", "smart_reassign", "unassign_conv", "pull_agent_chats",
-        "crm_sync", "auto_resolver_execute", "reopen_pending", "refresh_pending", "refresh_cw_counts"
-    }
-    has_non_action = (len(pending_cmds) == 0) or any(
-        isinstance(c, dict) and c.get("action") not in action_only_types for c in pending_cmds
-    )
-    if has_non_action:
-        restore_database_from_cloud(app_module=app_module, force_seed=False)
-    _last_applied_ui_ts = max(_last_applied_ui_ts, ui_ts)
+    if ui_ts > _last_applied_ui_ts:
+        action_only_types = {
+            "run_cycle", "smart_reassign", "unassign_conv", "pull_agent_chats",
+            "crm_sync", "auto_resolver_execute", "reopen_pending", "refresh_pending", "refresh_cw_counts"
+        }
+        has_non_action = (len(legacy_cmds) == 0) or any(
+            isinstance(c, dict) and c.get("action") not in action_only_types for c in legacy_cmds
+        )
+        if has_non_action:
+            restore_database_from_cloud(app_module=app_module, force_seed=False)
+        _last_applied_ui_ts = max(_last_applied_ui_ts, ui_ts)
+
+    for c in pending_cmds:
+        _last_applied_cmd_ts = max(_last_applied_cmd_ts, int(c.get("ts") or 0))
 
     for cmd in pending_cmds:
         if not isinstance(cmd, dict):
@@ -694,17 +731,31 @@ def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Syn
                 "all_labels": cw_labels if cw_labels else [{"title": l} for l in valid_labels_order]
             },
             "delays_report": delays_report,
-            "pending_summary": pending_summary,
-            "resolve_audit": _last_resolve_audit_bundle,
-            "auto_resolver_pool": _last_auto_resolver_pool
+            "pending_summary": pending_summary
         }
 
         json_bytes = json.dumps(cloud_data, ensure_ascii=False).encode("utf-8")
         b64_content = base64.b64encode(json_bytes).decode("ascii")
 
-        line1 = json.dumps({"key": "header", "value": {"summary": summary}})
-        line2 = json.dumps({"key": "file", "value": {"content": b64_content, "path": "data.json", "encoding": "base64"}})
-        ndjson_body = f"{line1}\n{line2}"
+        cmd_clear_bytes = json.dumps({"commands": [], "cleared_at": int(time.time() * 1000)}).encode("utf-8")
+        b64_cmd = base64.b64encode(cmd_clear_bytes).decode("ascii")
+
+        lines = [
+            json.dumps({"key": "header", "value": {"summary": summary}}),
+            json.dumps({"key": "file", "value": {"content": b64_content, "path": "data.json", "encoding": "base64"}}),
+            json.dumps({"key": "file", "value": {"content": b64_cmd, "path": "commands.json", "encoding": "base64"}})
+        ]
+
+        if not fast_only:
+            heavy_payload = {
+                "updated_at": datetime.now(CAIRO_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+                "resolve_audit": _last_resolve_audit_bundle,
+                "auto_resolver_pool": _last_auto_resolver_pool
+            }
+            b64_heavy = base64.b64encode(json.dumps(heavy_payload, ensure_ascii=False).encode("utf-8")).decode("ascii")
+            lines.append(json.dumps({"key": "file", "value": {"content": b64_heavy, "path": "reports_heavy.json", "encoding": "base64"}}))
+
+        ndjson_body = "\n".join(lines)
 
         tok = get_hf_token()
         r = requests.post(

@@ -3,6 +3,8 @@ import * as XLSX from 'xlsx';
 const HF_USERNAME = 'ar7222';
 const HF_DATASET_REPO = `${HF_USERNAME}/chatwoot-smart-router-db`;
 const CLOUD_DATA_URL = `https://huggingface.co/datasets/${HF_DATASET_REPO}/resolve/main/data.json`;
+const CLOUD_COMMANDS_URL = `https://huggingface.co/datasets/${HF_DATASET_REPO}/resolve/main/commands.json`;
+const CLOUD_HEAVY_URL = `https://huggingface.co/datasets/${HF_DATASET_REPO}/resolve/main/reports_heavy.json`;
 const CLOUD_COMMIT_URL = `https://huggingface.co/api/datasets/${HF_DATASET_REPO}/commit/main`;
 
 // Reverse token at runtime to prevent Hugging Face secret scanner from blocking built JS assets
@@ -30,9 +32,52 @@ async function sha256Hex(message) {
 
 let _cloudCache = null;
 let _cloudCacheTs = 0;
+let _heavyReportsCache = null;
+let _heavyReportsCacheTs = 0;
 let _staticBundleCache = null;
 let _optimisticPendingSummary = null;
 let _optimisticPendingUntil = 0;
+
+async function ensureHeavyReportsLoaded(db, forceRefresh = false) {
+  const now = Date.now();
+  const hasAudit = Array.isArray(db?.resolve_audit?.data?.agents) && db.resolve_audit.data.agents.length > 0;
+  const hasAr = Array.isArray(db?.auto_resolver_pool?.items) && db.auto_resolver_pool.items.length > 0;
+  if (!forceRefresh && hasAudit && hasAr) return db;
+
+  if (!forceRefresh && _heavyReportsCache && (now - _heavyReportsCacheTs < 60000)) {
+    db.resolve_audit = _heavyReportsCache.resolve_audit || db.resolve_audit;
+    db.auto_resolver_pool = _heavyReportsCache.auto_resolver_pool || db.auto_resolver_pool;
+    return db;
+  }
+
+  try {
+    const res = await fetch(`${CLOUD_HEAVY_URL}?t=${now}`, {
+      cache: 'no-store',
+      headers: { Authorization: `Bearer ${getHfToken()}` }
+    });
+    if (res.ok) {
+      const heavy = await res.json();
+      _heavyReportsCache = heavy;
+      _heavyReportsCacheTs = now;
+      if (heavy.resolve_audit) db.resolve_audit = heavy.resolve_audit;
+      if (heavy.auto_resolver_pool) db.auto_resolver_pool = heavy.auto_resolver_pool;
+      return db;
+    }
+  } catch (_) {}
+
+  try {
+    if (!_staticBundleCache) {
+      const r = await fetch(`./data.json?v=static`, { cache: 'no-store' });
+      if (r.ok) _staticBundleCache = await r.json();
+    }
+    if (_staticBundleCache) {
+      if (!hasAudit && _staticBundleCache.resolve_audit) db.resolve_audit = _staticBundleCache.resolve_audit;
+      if (!hasAr && _staticBundleCache.auto_resolver_pool) db.auto_resolver_pool = _staticBundleCache.auto_resolver_pool;
+    }
+  } catch (_) {}
+
+  return db;
+}
 
 async function hydrateMissingFromStaticBundle(data) {
   if (!data || typeof data !== 'object') return data;
@@ -40,11 +85,9 @@ async function hydrateMissingFromStaticBundle(data) {
     data.pending_summary = _optimisticPendingSummary;
   }
   const missingPending = !Array.isArray(data.pending_summary?.labels) || data.pending_summary.labels.length === 0;
-  const missingAutoResolver = !Array.isArray(data.auto_resolver_pool?.items) || data.auto_resolver_pool.items.length === 0;
-  const missingResolveAudit = !Array.isArray(data.resolve_audit?.data?.agents) || data.resolve_audit.data.agents.length === 0;
   const missingOpenChats = Array.isArray(data.agents) && !data.agents.some(a => Number(a.chatwoot_open_chats || a.active_chats || 0) > 0);
 
-  if (missingPending || missingAutoResolver || missingResolveAudit || missingOpenChats) {
+  if (missingPending || missingOpenChats) {
     try {
       if (!_staticBundleCache) {
         const r = await fetch(`./data.json?v=static`, { cache: 'no-store' });
@@ -55,12 +98,6 @@ async function hydrateMissingFromStaticBundle(data) {
       if (_staticBundleCache) {
         if (missingPending && _staticBundleCache.pending_summary?.labels?.length > 0) {
           data.pending_summary = _staticBundleCache.pending_summary;
-        }
-        if (missingAutoResolver && _staticBundleCache.auto_resolver_pool?.items?.length > 0) {
-          data.auto_resolver_pool = _staticBundleCache.auto_resolver_pool;
-        }
-        if (missingResolveAudit && _staticBundleCache.resolve_audit?.data?.agents?.length > 0) {
-          data.resolve_audit = _staticBundleCache.resolve_audit;
         }
         if (missingOpenChats && Array.isArray(_staticBundleCache.agents)) {
           const staticOpenMap = {};
@@ -204,42 +241,48 @@ export async function loadCloudDatabase(forceRefresh = false) {
 }
 
 export async function saveCloudDatabase(dbData, summaryMessage = 'Update cloud database', pendingCommand = null) {
-  let payloadToSave = dbData;
+  // Fast Path (<100ms): When firing an action command (reopen_pending, run_cycle, refresh_pending, etc.),
+  // commit ONLY a tiny 150-byte commands.json file instead of uploading the full database!
   if (pendingCommand) {
-    try {
-      const freshRes = await fetch(`${CLOUD_DATA_URL}?t=${Date.now()}`, {
-        headers: { Authorization: `Bearer ${getHfToken()}`, 'Cache-Control': 'no-cache' }
-      });
-      if (freshRes.ok) {
-        const freshDb = await freshRes.json();
-        const existingCmds = Array.isArray(freshDb.pending_commands) ? freshDb.pending_commands : [];
-        freshDb.pending_commands = [...existingCmds, { ...pendingCommand, ts: Date.now() }];
-        if (pendingCommand.action === 'reopen_pending' && dbData.pending_summary) {
-          freshDb.pending_summary = dbData.pending_summary;
-        } else if (
-          ['smart_reassign', 'unassign_conv', 'pull_agent_chats'].includes(pendingCommand.action) &&
-          dbData.delays_report
-        ) {
-          freshDb.delays_report = dbData.delays_report;
-        } else if (pendingCommand.action === 'auto_resolver_execute' && dbData.auto_resolver_pool) {
-          freshDb.auto_resolver_pool = dbData.auto_resolver_pool;
-        }
-        payloadToSave = freshDb;
-      } else {
-        const existingCmds = Array.isArray(dbData.pending_commands) ? dbData.pending_commands : [];
-        dbData.pending_commands = [...existingCmds, { ...pendingCommand, ts: Date.now() }];
-      }
-    } catch (e) {
-      const existingCmds = Array.isArray(dbData.pending_commands) ? dbData.pending_commands : [];
-      dbData.pending_commands = [...existingCmds, { ...pendingCommand, ts: Date.now() }];
+    _cloudCache = dbData;
+    _cloudCacheTs = Date.now();
+    const cmdPayload = {
+      commands: [{ ...pendingCommand, ts: Date.now() }],
+      updated_at: Date.now()
+    };
+    const b64Cmd = utf8ToBase64(JSON.stringify(cmdPayload));
+    const headerLine = JSON.stringify({ key: 'header', value: { summary: summaryMessage } });
+    const fileLine = JSON.stringify({
+      key: 'file',
+      value: { content: b64Cmd, path: 'commands.json', encoding: 'base64' }
+    });
+    const res = await fetch(CLOUD_COMMIT_URL, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${getHfToken()}`,
+        'Content-Type': 'application/x-ndjson'
+      },
+      body: `${headerLine}\n${fileLine}`
+    });
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      throw new Error(`فشل إرسال الأمر السحابي (${res.status}): ${errText}`);
     }
+    return res.json();
   }
-  payloadToSave.updated_at = new Date().toISOString();
-  payloadToSave.ui_updated_at = Date.now();
-  _cloudCache = payloadToSave;
+
+  dbData.updated_at = new Date().toISOString();
+  dbData.ui_updated_at = Date.now();
+  _cloudCache = dbData;
   _cloudCacheTs = Date.now();
 
-  const jsonString = JSON.stringify(payloadToSave);
+  // Strip heavy 2MB reports (resolve_audit & auto_resolver_pool live in reports_heavy.json)
+  // so data.json stays ~200KB and saves 10x faster!
+  const lightweightDb = { ...dbData };
+  delete lightweightDb.resolve_audit;
+  delete lightweightDb.auto_resolver_pool;
+
+  const jsonString = JSON.stringify(lightweightDb);
   const b64Content = utf8ToBase64(jsonString);
 
   const headerLine = JSON.stringify({
@@ -1075,6 +1118,7 @@ export async function handleCloudApi(endpoint, options = {}) {
   }
 
   if (pathOnly === '/reports/resolve-audit') {
+    await ensureHeavyReportsLoaded(db, params.get('refresh') === 'true' || params.get('force') === 'true');
     const startD = params.get('startDate') || params.get('date') || body.startDate || body.date || '';
     const endD = params.get('endDate') || body.endDate || startD;
     const src = (params.get('source') || body.source || 'chatwoot').toLowerCase();
@@ -1135,6 +1179,7 @@ export async function handleCloudApi(endpoint, options = {}) {
   }
 
   if (pathOnly === '/auto-resolver/scan' && method === 'POST') {
+    await ensureHeavyReportsLoaded(db, Boolean(body.force_refresh));
     const targetStatus = String(body.status || 'pending').trim().toLowerCase();
     const labelMode = String(body.label_mode || 'all').trim().toLowerCase();
     const specificLabel = String(body.specific_label || '').trim().toLowerCase();

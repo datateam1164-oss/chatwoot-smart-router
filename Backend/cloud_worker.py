@@ -34,7 +34,7 @@ def _heavy_reports_sync_loop():
 
 def run_cloud_worker():
     max_seconds = int(os.environ.get("CLOUD_WORKER_MAX_SECONDS", "0"))
-    fast_poll_interval = 4
+    fast_poll_interval = 2
     start_ts = time.time()
 
     logger.info("☁️ Starting 24/7 Cloud Worker (Chatwoot <-> Hugging Face Dataset)...")

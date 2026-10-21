@@ -57,6 +57,13 @@ def run_cloud_worker():
     except Exception as e:
         logger.warning(f"⚠️ Initial CRM shift sync warning: {e}")
 
+    # Process any pending commands and push initial synced state immediately (<1s)
+    try:
+        hf_sync.poll_and_apply_cloud_ui_changes(router_app)
+        hf_sync.export_and_push_to_cloud(router_app, fast_only=True, summary="Initial worker startup & CRM shift sync")
+    except Exception as e:
+        logger.warning(f"⚠️ Initial fast cloud push warning: {e}")
+
     # Start non-blocking background thread for heavy reports (delays, pending counts, resolve audit)
     bg_thread = threading.Thread(target=_heavy_reports_sync_loop, daemon=True)
     bg_thread.start()

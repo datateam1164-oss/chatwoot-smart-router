@@ -343,7 +343,15 @@ def poll_and_apply_cloud_ui_changes(app_module) -> bool:
         return False
 
     logger.info(f"☁️ Detected Cloud UI update (ui_ts={ui_ts}, commands={len(pending_cmds)}). Applying...")
-    restore_database_from_cloud(app_module=app_module, force_seed=False)
+    action_only_types = {
+        "run_cycle", "smart_reassign", "unassign_conv", "pull_agent_chats",
+        "crm_sync", "auto_resolver_execute", "reopen_pending", "refresh_pending", "refresh_cw_counts"
+    }
+    has_non_action = (len(pending_cmds) == 0) or any(
+        isinstance(c, dict) and c.get("action") not in action_only_types for c in pending_cmds
+    )
+    if has_non_action:
+        restore_database_from_cloud(app_module=app_module, force_seed=False)
     _last_applied_ui_ts = max(_last_applied_ui_ts, ui_ts)
 
     for cmd in pending_cmds:

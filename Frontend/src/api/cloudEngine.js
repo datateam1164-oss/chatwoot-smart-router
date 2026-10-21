@@ -204,16 +204,42 @@ export async function loadCloudDatabase(forceRefresh = false) {
 }
 
 export async function saveCloudDatabase(dbData, summaryMessage = 'Update cloud database', pendingCommand = null) {
-  dbData.updated_at = new Date().toISOString();
-  dbData.ui_updated_at = Date.now();
+  let payloadToSave = dbData;
   if (pendingCommand) {
-    const existingCmds = Array.isArray(dbData.pending_commands) ? dbData.pending_commands : [];
-    dbData.pending_commands = [...existingCmds, { ...pendingCommand, ts: Date.now() }];
+    try {
+      const freshRes = await fetch(`${CLOUD_DATA_URL}?t=${Date.now()}`, {
+        headers: { Authorization: `Bearer ${getHfToken()}`, 'Cache-Control': 'no-cache' }
+      });
+      if (freshRes.ok) {
+        const freshDb = await freshRes.json();
+        const existingCmds = Array.isArray(freshDb.pending_commands) ? freshDb.pending_commands : [];
+        freshDb.pending_commands = [...existingCmds, { ...pendingCommand, ts: Date.now() }];
+        if (pendingCommand.action === 'reopen_pending' && dbData.pending_summary) {
+          freshDb.pending_summary = dbData.pending_summary;
+        } else if (
+          ['smart_reassign', 'unassign_conv', 'pull_agent_chats'].includes(pendingCommand.action) &&
+          dbData.delays_report
+        ) {
+          freshDb.delays_report = dbData.delays_report;
+        } else if (pendingCommand.action === 'auto_resolver_execute' && dbData.auto_resolver_pool) {
+          freshDb.auto_resolver_pool = dbData.auto_resolver_pool;
+        }
+        payloadToSave = freshDb;
+      } else {
+        const existingCmds = Array.isArray(dbData.pending_commands) ? dbData.pending_commands : [];
+        dbData.pending_commands = [...existingCmds, { ...pendingCommand, ts: Date.now() }];
+      }
+    } catch (e) {
+      const existingCmds = Array.isArray(dbData.pending_commands) ? dbData.pending_commands : [];
+      dbData.pending_commands = [...existingCmds, { ...pendingCommand, ts: Date.now() }];
+    }
   }
-  _cloudCache = dbData;
+  payloadToSave.updated_at = new Date().toISOString();
+  payloadToSave.ui_updated_at = Date.now();
+  _cloudCache = payloadToSave;
   _cloudCacheTs = Date.now();
 
-  const jsonString = JSON.stringify(dbData);
+  const jsonString = JSON.stringify(payloadToSave);
   const b64Content = utf8ToBase64(jsonString);
 
   const headerLine = JSON.stringify({
@@ -247,21 +273,23 @@ export async function saveCloudDatabase(dbData, summaryMessage = 'Update cloud d
 }
 
 function computeAgentInShift(ag) {
+  if (ag.team === 'Data') return true;
   const s = ag.shift_start;
   const e = ag.shift_end;
   if (s === null || s === undefined || e === null || e === undefined) return false;
   const txt = String(ag.shift_text || '').toLowerCase();
-  if (txt.includes('weekend') || txt.includes('off')) return false;
+  if (!ag.is_manual_shift && (txt.includes('weekend') || txt.includes('off') || txt.includes('اجازة') || txt.includes('إجازة'))) {
+    return false;
+  }
   const nowCairo = new Date(new Date().toLocaleString('en-US', { timeZone: 'Africa/Cairo' }));
   const h = nowCairo.getHours();
   const startH = Number(s);
-  const endH = Number(e);
-  if (startH < endH) {
+  const endH = Number(e) - 1;
+  if (startH <= endH) {
     return h >= startH && h < endH;
-  } else if (startH > endH) {
+  } else {
     return h >= startH || h < endH;
   }
-  return false;
 }
 
 function recomputeStatus(db) {

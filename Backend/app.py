@@ -162,6 +162,9 @@ def sync_chatwoot_agents_to_db():
 def _agent_in_shift_hours(agent_row: dict) -> bool:
     if agent_row.get("team") == "Data":
         return True  # Data team is always available for testing
+    st_text = str(agent_row.get("shift_text") or "").strip().lower()
+    if not agent_row.get("is_manual_shift") and st_text in ("weekend", "off", "اجازة", "إجازة"):
+        return False
     start = agent_row.get("shift_start")
     end = agent_row.get("shift_end")
     if start is None or end is None:

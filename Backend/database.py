@@ -217,6 +217,7 @@ def upsert_agent(agent_data):
     conn = get_db()
     cursor = conn.cursor()
     now_str = datetime.now(CAIRO_TZ).isoformat()
+    has_shift_keys = ("shift_start" in agent_data) or ("shift_text" in agent_data)
     cursor.execute("""
     INSERT INTO agents (
         id, name, crm_name, shift_start, shift_end, shift_text,
@@ -225,25 +226,28 @@ def upsert_agent(agent_data):
     ) VALUES (
         :id, :name, :crm_name, :shift_start, :shift_end, :shift_text,
         :shift_start, :shift_end, :shift_text,
-        :is_selected, :is_paused, :chat_limit, :team, :coordinator_name, :updated_at
+        COALESCE(:is_selected, 1), :is_paused, :chat_limit, :team, :coordinator_name, :updated_at
     )
     ON CONFLICT(id) DO UPDATE SET
         name = COALESCE(:name, agents.name),
         crm_name = COALESCE(:crm_name, agents.crm_name),
-        crm_shift_start = COALESCE(:shift_start, agents.crm_shift_start),
-        crm_shift_end = COALESCE(:shift_end, agents.crm_shift_end),
-        crm_shift_text = COALESCE(:shift_text, agents.crm_shift_text),
+        crm_shift_start = CASE WHEN :has_shift_keys = 1 THEN :shift_start ELSE agents.crm_shift_start END,
+        crm_shift_end = CASE WHEN :has_shift_keys = 1 THEN :shift_end ELSE agents.crm_shift_end END,
+        crm_shift_text = CASE WHEN :has_shift_keys = 1 THEN :shift_text ELSE agents.crm_shift_text END,
         shift_start = CASE 
             WHEN agents.is_manual_shift = 1 AND agents.manual_shift_date = :today_date THEN agents.shift_start 
-            ELSE COALESCE(:shift_start, agents.shift_start) 
+            WHEN :has_shift_keys = 1 THEN :shift_start
+            ELSE agents.shift_start 
         END,
         shift_end = CASE 
             WHEN agents.is_manual_shift = 1 AND agents.manual_shift_date = :today_date THEN agents.shift_end 
-            ELSE COALESCE(:shift_end, agents.shift_end) 
+            WHEN :has_shift_keys = 1 THEN :shift_end
+            ELSE agents.shift_end 
         END,
         shift_text = CASE 
             WHEN agents.is_manual_shift = 1 AND agents.manual_shift_date = :today_date THEN agents.shift_text 
-            ELSE COALESCE(:shift_text, agents.shift_text) 
+            WHEN :has_shift_keys = 1 THEN :shift_text
+            ELSE agents.shift_text 
         END,
         is_manual_shift = CASE 
             WHEN agents.is_manual_shift = 1 AND agents.manual_shift_date = :today_date THEN 1 
@@ -267,6 +271,7 @@ def upsert_agent(agent_data):
         "shift_start": agent_data.get("shift_start"),
         "shift_end": agent_data.get("shift_end"),
         "shift_text": agent_data.get("shift_text") or None,
+        "has_shift_keys": 1 if has_shift_keys else 0,
         "is_selected": agent_data.get("is_selected"),
         "is_paused": agent_data.get("is_paused", 0),
         "chat_limit": agent_data.get("chat_limit", 10),

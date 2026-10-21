@@ -378,7 +378,7 @@ def poll_and_apply_cloud_ui_changes(app_module) -> bool:
     logger.info(f"☁️ Detected Cloud UI update (ui_ts={ui_ts}, commands={len(pending_cmds)}). Applying...")
     if ui_ts > _last_applied_ui_ts:
         action_only_types = {
-            "run_cycle", "smart_reassign", "unassign_conv", "pull_agent_chats",
+            "set_routing", "run_cycle", "smart_reassign", "unassign_conv", "pull_agent_chats",
             "crm_sync", "auto_resolver_execute", "reopen_pending", "refresh_pending", "refresh_cw_counts"
         }
         has_non_action = (len(legacy_cmds) == 0) or any(
@@ -397,7 +397,17 @@ def poll_and_apply_cloud_ui_changes(app_module) -> bool:
         action = cmd.get("action")
         payload = cmd.get("payload") or {}
         try:
-            if action == "run_cycle":
+            if action == "set_routing":
+                enabled_flag = bool(payload.get("enabled"))
+                app_module.set_routing_enabled(enabled_flag)
+                logger.info(f"☁️ Executed cloud command 'set_routing': enabled={enabled_flag}")
+                if enabled_flag:
+                    try:
+                        routed = app_module._run_single_routing_loop_safe()
+                        logger.info(f"⚡ Immediate routing cycle on Start: routed={routed}")
+                    except Exception as sr_err:
+                        logger.warning(f"⚠️ Immediate cycle on start warning: {sr_err}")
+            elif action == "run_cycle":
                 routed = app_module._run_single_routing_loop_safe()
                 logger.info(f"☁️ Executed cloud command 'run_cycle': routed={routed}")
             elif action == "smart_reassign":
@@ -495,9 +505,102 @@ def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Syn
     Builds a fresh snapshot of SQLite + live Chatwoot delays/scores and commits
     it to ar7222/chatwoot-smart-router-db (data.json).
     When fast_only=True, reuses cached heavy reports so commit finishes in <1s.
+    Slow Chatwoot network calls run OUTSIDE _sync_lock and BEFORE reading SQLite
+    settings/agents so user actions (Start/Stop/Select) are NEVER blocked or overwritten.
     """
     global _last_resolve_audit_bundle, _last_resolve_audit_ts, _last_auto_resolver_pool, _last_auto_resolver_ts, _last_pending_summary, _last_delays_report, _last_cw_labels
-    if not _sync_lock.acquire(blocking=False):
+
+    # 1. Perform slow Chatwoot network calls OUTSIDE _sync_lock so fast commands never wait or get dropped
+    if not fast_only:
+        try:
+            with app_module._agent_report_lock:
+                has_cw_counts = bool(app_module._agent_report_cache)
+            if not has_cw_counts:
+                app_module.fetch_agent_report_counts()
+        except Exception:
+            pass
+
+        try:
+            cw_labels_fresh = app_module.fetch_chatwoot_labels()
+            if cw_labels_fresh:
+                _last_cw_labels = cw_labels_fresh
+        except Exception:
+            pass
+
+        try:
+            fresh_delays = app_module._build_delays_report(num_pages=num_pages)
+            if isinstance(fresh_delays, dict) and fresh_delays.get("summary"):
+                _last_delays_report = fresh_delays
+        except Exception as e:
+            logger.warning(f"⚠️ Cloud sync delays_report warning: {e}")
+
+        try:
+            fresh_ps = app_module._fetch_pending_summary(force_refresh=True)
+            if isinstance(fresh_ps, dict) and fresh_ps.get("labels"):
+                _last_pending_summary = fresh_ps
+        except Exception as e:
+            logger.warning(f"⚠️ Cloud sync pending_summary warning: {e}")
+
+        now_ts = time.time()
+        has_valid_audit = (
+            isinstance(_last_resolve_audit_bundle, dict)
+            and isinstance(_last_resolve_audit_bundle.get("data"), dict)
+            and len((_last_resolve_audit_bundle.get("data") or {}).get("agents") or []) > 0
+        )
+        if not has_valid_audit or (now_ts - _last_resolve_audit_ts >= 900):
+            try:
+                existing_ranges = (_last_resolve_audit_bundle or {}).get("ranges") or {}
+                expected_yest = (datetime.now(CAIRO_TZ) - timedelta(days=1)).strftime("%Y-%m-%d")
+                cached_yest = existing_ranges.get("chatwoot_yesterday") or {}
+                cached_yest_date = (cached_yest.get("summary") or {}).get("date", "")
+                day_changed = (cached_yest_date != expected_yest)
+
+                audit_today = _compact_audit_payload(app_module.audit_conversations_for_agents(date_str="today", source="chatwoot"))
+                audit_sys_today = _compact_audit_payload(app_module.audit_conversations_for_agents(date_str="today", source="system"))
+                audit_yesterday = (
+                    _compact_audit_payload(app_module.audit_conversations_for_agents(date_str="yesterday", source="chatwoot"))
+                    if (day_changed or not cached_yest)
+                    else cached_yest
+                )
+                audit_2days = (
+                    _compact_audit_payload(app_module.audit_conversations_for_agents(date_str="2days", source="chatwoot"))
+                    if (day_changed or not existing_ranges.get("chatwoot_2days"))
+                    else existing_ranges.get("chatwoot_2days")
+                )
+                _last_resolve_audit_bundle = {
+                    "success": True,
+                    "data": audit_today,
+                    "ranges": {
+                        "chatwoot_yesterday": audit_yesterday,
+                        "chatwoot_2days": audit_2days,
+                        "system_today": audit_sys_today
+                    }
+                }
+                _last_resolve_audit_ts = now_ts
+            except Exception as e:
+                logger.warning(f"⚠️ Cloud sync resolve_audit refresh warning: {e}")
+
+        has_valid_ar = (
+            isinstance(_last_auto_resolver_pool, dict)
+            and isinstance(_last_auto_resolver_pool.get("items"), list)
+        )
+        if not has_valid_ar or (now_ts - _last_auto_resolver_ts >= 900):
+            try:
+                _last_auto_resolver_pool = _build_auto_resolver_pool(app_module, max_pages=20, min_hours=24.0)
+                _last_auto_resolver_ts = now_ts
+            except Exception as e:
+                logger.warning(f"⚠️ Cloud sync auto_resolver_pool warning: {e}")
+
+        # Before acquiring lock and reading SQLite, apply any UI changes/commands that arrived during the slow Chatwoot scan!
+        if not is_local_server:
+            try:
+                poll_and_apply_cloud_ui_changes(app_module)
+            except Exception:
+                pass
+
+    # 2. Acquire lock (fast pushes wait up to 10s so user actions are NEVER dropped)
+    acquired = _sync_lock.acquire(timeout=10) if fast_only else _sync_lock.acquire(blocking=False)
+    if not acquired:
         return False
 
     try:
@@ -509,11 +612,6 @@ def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Syn
 
         with app_module._agent_report_lock:
             cw_counts = dict(app_module._agent_report_cache)
-        if not cw_counts and not fast_only:
-            try:
-                cw_counts = app_module.fetch_agent_report_counts()
-            except Exception:
-                cw_counts = {}
 
         enriched_agents = []
         for ag in all_agents:
@@ -555,50 +653,31 @@ def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Syn
         except Exception:
             valid_labels_order = []
 
-        if fast_only and _last_cw_labels:
-            cw_labels = _last_cw_labels
-        else:
-            try:
-                cw_labels = app_module.fetch_chatwoot_labels()
-                if cw_labels:
-                    _last_cw_labels = cw_labels
-            except Exception:
-                cw_labels = _last_cw_labels or []
+        cw_labels = _last_cw_labels or []
 
-        if fast_only and _last_delays_report:
-            delays_report = _last_delays_report
-            delays_report["smart_reassign_config"] = app_module._get_smart_reassign_config()
-            delays_report["configured_sales_labels"] = valid_labels_order
-            delays_report["smart_reassign_history"] = list(app_module._smart_reassign_history[:35])
-        else:
-            try:
-                delays_report = app_module._build_delays_report(num_pages=num_pages)
-                delays_report["smart_reassign_config"] = app_module._get_smart_reassign_config()
-                delays_report["configured_sales_labels"] = valid_labels_order
-                delays_report["smart_reassign_history"] = list(app_module._smart_reassign_history[:35])
-                _last_delays_report = delays_report
-            except Exception as e:
-                logger.warning(f"⚠️ Cloud sync delays_report warning: {e}")
-                delays_report = _last_delays_report or {
-                    "success": True,
-                    "summary": {
-                        "total_scanned_chats": 0,
-                        "total_pending_chats": 0,
-                        "total_exempt_chats": 0,
-                        "critical_count": 0,
-                        "warning_count": 0,
-                        "normal_count": 0,
-                        "longest_delay_formatted": "0 دقيقة",
-                        "most_delayed_agent": "لا يوجد",
-                        "top_scored_agent": "لا يوجد",
-                        "timestamp": datetime.now(CAIRO_TZ).strftime("%Y-%m-%d %I:%M:%S %p")
-                    },
-                    "pending_chats": [],
-                    "agents_summary": [],
-                    "configured_sales_labels": valid_labels_order,
-                    "smart_reassign_config": app_module._get_smart_reassign_config(),
-                    "smart_reassign_history": list(app_module._smart_reassign_history[:35])
-                }
+        delays_report = _last_delays_report or {
+            "success": True,
+            "summary": {
+                "total_scanned_chats": 0,
+                "total_pending_chats": 0,
+                "total_exempt_chats": 0,
+                "critical_count": 0,
+                "warning_count": 0,
+                "normal_count": 0,
+                "longest_delay_formatted": "0 دقيقة",
+                "most_delayed_agent": "لا يوجد",
+                "top_scored_agent": "لا يوجد",
+                "timestamp": datetime.now(CAIRO_TZ).strftime("%Y-%m-%d %I:%M:%S %p")
+            },
+            "pending_chats": [],
+            "agents_summary": [],
+            "configured_sales_labels": valid_labels_order,
+            "smart_reassign_config": app_module._get_smart_reassign_config(),
+            "smart_reassign_history": list(app_module._smart_reassign_history[:35])
+        }
+        delays_report["smart_reassign_config"] = app_module._get_smart_reassign_config()
+        delays_report["configured_sales_labels"] = valid_labels_order
+        delays_report["smart_reassign_history"] = list(app_module._smart_reassign_history[:35])
 
         delays_open_map = {
             str(item.get("agent_id")): int(item.get("open_chats_count") or 0)
@@ -611,16 +690,7 @@ def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Syn
             ag_item["active_chats"] = best_open
             ag_item["chatwoot_open_chats"] = best_open
 
-        if fast_only and _last_pending_summary:
-            pending_summary = _last_pending_summary
-        else:
-            try:
-                pending_summary = app_module._fetch_pending_summary(force_refresh=True)
-                if isinstance(pending_summary, dict) and pending_summary.get("labels"):
-                    _last_pending_summary = pending_summary
-            except Exception as e:
-                logger.warning(f"⚠️ Cloud sync pending_summary warning: {e}")
-                pending_summary = _last_pending_summary or {"success": True, "total_unassigned_pending": 0, "labels": []}
+        pending_summary = _last_pending_summary or {"success": True, "total_unassigned_pending": 0, "labels": []}
 
         selected_in_shift = [
             a for a in enriched_agents if a.get("is_selected") and not a.get("is_paused") and a.get("in_shift")
@@ -636,45 +706,6 @@ def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Syn
             "window_minutes": window_minutes,
             "worker_heartbeat": datetime.now(CAIRO_TZ).strftime("%Y-%m-%d %I:%M:%S %p")
         }
-
-        now_ts = time.time()
-        has_valid_audit = (
-            isinstance(_last_resolve_audit_bundle, dict)
-            and isinstance(_last_resolve_audit_bundle.get("data"), dict)
-            and len((_last_resolve_audit_bundle.get("data") or {}).get("agents") or []) > 0
-        )
-        if not fast_only and (not has_valid_audit or (now_ts - _last_resolve_audit_ts >= 900)):
-            try:
-                existing_ranges = (_last_resolve_audit_bundle or {}).get("ranges") or {}
-                expected_yest = (datetime.now(CAIRO_TZ) - timedelta(days=1)).strftime("%Y-%m-%d")
-                cached_yest = existing_ranges.get("chatwoot_yesterday") or {}
-                cached_yest_date = (cached_yest.get("summary") or {}).get("date", "")
-                day_changed = (cached_yest_date != expected_yest)
-
-                audit_today = _compact_audit_payload(app_module.audit_conversations_for_agents(date_str="today", source="chatwoot"))
-                audit_sys_today = _compact_audit_payload(app_module.audit_conversations_for_agents(date_str="today", source="system"))
-                audit_yesterday = (
-                    _compact_audit_payload(app_module.audit_conversations_for_agents(date_str="yesterday", source="chatwoot"))
-                    if (day_changed or not cached_yest)
-                    else cached_yest
-                )
-                audit_2days = (
-                    _compact_audit_payload(app_module.audit_conversations_for_agents(date_str="2days", source="chatwoot"))
-                    if (day_changed or not existing_ranges.get("chatwoot_2days"))
-                    else existing_ranges.get("chatwoot_2days")
-                )
-                _last_resolve_audit_bundle = {
-                    "success": True,
-                    "data": audit_today,
-                    "ranges": {
-                        "chatwoot_yesterday": audit_yesterday,
-                        "chatwoot_2days": audit_2days,
-                        "system_today": audit_sys_today
-                    }
-                }
-                _last_resolve_audit_ts = now_ts
-            except Exception as e:
-                logger.warning(f"⚠️ Cloud sync resolve_audit refresh warning: {e}")
 
         if not _last_resolve_audit_bundle:
             _last_resolve_audit_bundle = {
@@ -701,16 +732,6 @@ def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Syn
                 "ranges": {}
             }
 
-        has_valid_ar = (
-            isinstance(_last_auto_resolver_pool, dict)
-            and isinstance(_last_auto_resolver_pool.get("items"), list)
-        )
-        if not fast_only and (not has_valid_ar or (now_ts - _last_auto_resolver_ts >= 900)):
-            try:
-                _last_auto_resolver_pool = _build_auto_resolver_pool(app_module, max_pages=20, min_hours=24.0)
-                _last_auto_resolver_ts = now_ts
-            except Exception as e:
-                logger.warning(f"⚠️ Cloud sync auto_resolver_pool warning: {e}")
         if not _last_auto_resolver_pool:
             _last_auto_resolver_pool = {"total_scanned": 0, "updated_at": "", "items": []}
 
@@ -737,16 +758,16 @@ def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Syn
         json_bytes = json.dumps(cloud_data, ensure_ascii=False).encode("utf-8")
         b64_content = base64.b64encode(json_bytes).decode("ascii")
 
-        cmd_clear_bytes = json.dumps({"commands": [], "cleared_at": int(time.time() * 1000)}).encode("utf-8")
-        b64_cmd = base64.b64encode(cmd_clear_bytes).decode("ascii")
-
         lines = [
             json.dumps({"key": "header", "value": {"summary": summary}}),
-            json.dumps({"key": "file", "value": {"content": b64_content, "path": "data.json", "encoding": "base64"}}),
-            json.dumps({"key": "file", "value": {"content": b64_cmd, "path": "commands.json", "encoding": "base64"}})
+            json.dumps({"key": "file", "value": {"content": b64_content, "path": "data.json", "encoding": "base64"}})
         ]
 
-        if not fast_only:
+        if fast_only:
+            cmd_clear_bytes = json.dumps({"commands": [], "cleared_at": int(time.time() * 1000)}).encode("utf-8")
+            b64_cmd = base64.b64encode(cmd_clear_bytes).decode("ascii")
+            lines.append(json.dumps({"key": "file", "value": {"content": b64_cmd, "path": "commands.json", "encoding": "base64"}}))
+        else:
             heavy_payload = {
                 "updated_at": datetime.now(CAIRO_TZ).strftime("%Y-%m-%d %H:%M:%S"),
                 "resolve_audit": _last_resolve_audit_bundle,

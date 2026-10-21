@@ -37,6 +37,8 @@ let _heavyReportsCacheTs = 0;
 let _staticBundleCache = null;
 let _optimisticPendingSummary = null;
 let _optimisticPendingUntil = 0;
+let _optimisticRoutingState = null;
+let _optimisticRoutingUntil = 0;
 
 async function ensureHeavyReportsLoaded(db, forceRefresh = false) {
   const now = Date.now();
@@ -83,6 +85,12 @@ async function hydrateMissingFromStaticBundle(data) {
   if (!data || typeof data !== 'object') return data;
   if (_optimisticPendingSummary && Date.now() < _optimisticPendingUntil) {
     data.pending_summary = _optimisticPendingSummary;
+  }
+  if (_optimisticRoutingState !== null && Date.now() < _optimisticRoutingUntil) {
+    if (!data.settings) data.settings = {};
+    data.settings.routing_enabled = _optimisticRoutingState ? 'true' : 'false';
+    if (!data.status) data.status = {};
+    data.status.routing_enabled = Boolean(_optimisticRoutingState);
   }
   const missingPending = !Array.isArray(data.pending_summary?.labels) || data.pending_summary.labels.length === 0;
   const missingOpenChats = Array.isArray(data.agents) && !data.agents.some(a => Number(a.chatwoot_open_chats || a.active_chats || 0) > 0);
@@ -940,16 +948,28 @@ export async function handleCloudApi(endpoint, options = {}) {
   }
 
   if (pathOnly === '/routing/start' && method === 'POST') {
+    _optimisticRoutingState = true;
+    _optimisticRoutingUntil = Date.now() + 25000;
     db.settings = { ...(db.settings || {}), routing_enabled: 'true' };
     recomputeStatus(db);
-    await saveCloudDatabase(db, 'Start routing engine');
+    await saveCloudDatabase(db, 'Start routing engine', {
+      action: 'set_routing',
+      payload: { enabled: true }
+    });
+    saveCloudDatabase(db, 'Persist routing_enabled=true').catch(() => {});
     return { success: true, routing_enabled: true };
   }
 
   if (pathOnly === '/routing/stop' && method === 'POST') {
+    _optimisticRoutingState = false;
+    _optimisticRoutingUntil = Date.now() + 25000;
     db.settings = { ...(db.settings || {}), routing_enabled: 'false' };
     recomputeStatus(db);
-    await saveCloudDatabase(db, 'Stop routing engine');
+    await saveCloudDatabase(db, 'Stop routing engine', {
+      action: 'set_routing',
+      payload: { enabled: false }
+    });
+    saveCloudDatabase(db, 'Persist routing_enabled=false').catch(() => {});
     return { success: true, routing_enabled: false };
   }
 

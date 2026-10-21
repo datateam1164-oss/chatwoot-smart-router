@@ -3756,11 +3756,8 @@ def bootstrap_engine(start_threads: bool = True):
         return
     _engine_bootstrapped = True
 
-    logger.info("🚀 Initializing Chatwoot Smart Router & Cloud Sync...")
+    logger.info("🚀 Initializing Chatwoot Smart Router (Local Mode)...")
     database.init_db()
-
-    # Restore persistent cloud state from Hugging Face Dataset (ar7222/chatwoot-smart-router-db)
-    hf_sync.restore_database_from_cloud(sys.modules[__name__])
 
     # 1. Load initial agents and teams from Chatwoot
     _refresh_team_cache()
@@ -3780,9 +3777,6 @@ def bootstrap_engine(start_threads: bool = True):
 
         report_thread = threading.Thread(target=_periodic_agent_report_updater, daemon=True, name="CWReportUpdater")
         report_thread.start()
-
-        cloud_sync_thread = threading.Thread(target=_periodic_cloud_sync_loop, daemon=True, name="HFCloudSync")
-        cloud_sync_thread.start()
 
 if os.environ.get('RENDER') or os.environ.get('GUNICORN_CMD_ARGS') or os.environ.get('AUTO_BOOTSTRAP') == '1':
     bootstrap_engine(start_threads=True)

@@ -105,6 +105,8 @@ def restore_database_from_cloud(app_module=None, force_seed: bool = False) -> bo
     Hugging Face cloud dataset (data.json). Ideal when starting on a fresh cloud
     worker / Render container or synchronizing state on startup.
     """
+    if os.environ.get("ENABLE_CLOUD_SYNC") != "1":
+        return False
     global _last_applied_ui_ts
     cloud_data = fetch_cloud_database()
     if not cloud_data or not isinstance(cloud_data, dict):
@@ -389,6 +391,8 @@ def poll_and_apply_cloud_ui_changes(app_module) -> bool:
     Applies them to SQLite and executes live Chatwoot commands immediately.
     Returns True if any change or command was processed.
     """
+    if os.environ.get("ENABLE_CLOUD_SYNC") != "1":
+        return False
     global _last_applied_ui_ts, _last_applied_cmd_ts, _applied_cmd_ids, _needs_heavy_push, _last_seen_local_server_ts, _last_delays_report, _last_auto_resolver_pool, _last_resolve_audit_bundle, _last_resolve_audit_ts
     fast_cmds = fetch_cloud_commands()
     new_fast_cmds = [
@@ -602,6 +606,8 @@ def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Syn
     Slow Chatwoot network calls run OUTSIDE _sync_lock and BEFORE reading SQLite
     settings/agents so user actions (Start/Stop/Select) are NEVER blocked or overwritten.
     """
+    if os.environ.get("ENABLE_CLOUD_SYNC") != "1":
+        return False
     global _last_resolve_audit_bundle, _last_resolve_audit_ts, _last_auto_resolver_pool, _last_auto_resolver_ts, _last_pending_summary, _last_delays_report, _last_cw_labels, _needs_heavy_push
 
     # 1. Perform slow Chatwoot network calls OUTSIDE _sync_lock so fast commands never wait or get dropped

@@ -78,26 +78,16 @@ async function apiFetch(endpoint, options = {}) {
     headers['Authorization'] = `Bearer ${token}`;
   }
 
-  try {
-    const res = await fetch(url, { ...options, headers });
-    if (res.status === 404 || res.status === 405 || res.status === 502 || res.status === 503 || res.status === 504) {
-      const cloudData = await handleCloudApi(endpoint, options);
-      return makeCloudResponse(cloudData, 200);
+  const res = await fetch(url, { ...options, headers });
+  if (res.status === 401 && !endpoint.includes('/auth/login')) {
+    authStorage.clearAll();
+    if (typeof window !== 'undefined' && !window.location.pathname.includes('/login')) {
+      window.location.href = '/login';
     }
-    if (res.status === 401 && !endpoint.includes('/auth/login')) {
-      authStorage.clearAll();
-      if (typeof window !== 'undefined' && !window.location.pathname.includes('/login')) {
-        window.location.href = '/login';
-      }
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.error || 'غير مصرح بالدخول');
-    }
-    return res;
-  } catch (networkErr) {
-    // Fallback to cloud engine when local server is stopped/offline
-    const cloudData = await handleCloudApi(endpoint, options);
-    return makeCloudResponse(cloudData, 200);
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || 'غير مصرح بالدخول');
   }
+  return res;
 }
 
 export const authApi = {
@@ -114,32 +104,20 @@ export const authApi = {
       return data;
     }
 
-    try {
-      const res = await fetch(`${BASE_URL}/auth/login`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password })
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'فشل تسجيل الدخول');
-      }
-      if (data.token) {
-        authStorage.setToken(data.token);
-        authStorage.setUser(data.user);
-      }
-      return data;
-    } catch (err) {
-      const data = await handleCloudApi('/auth/login', {
-        method: 'POST',
-        body: JSON.stringify({ username, password })
-      });
-      if (data.token) {
-        authStorage.setToken(data.token);
-        authStorage.setUser(data.user);
-      }
-      return data;
+    const res = await fetch(`${BASE_URL}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || 'فشل تسجيل الدخول');
     }
+    if (data.token) {
+      authStorage.setToken(data.token);
+      authStorage.setUser(data.user);
+    }
+    return data;
   },
 
   async getMe() {

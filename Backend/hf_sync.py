@@ -84,6 +84,21 @@ def fetch_cloud_commands() -> list:
     return []
 
 
+def fetch_cloud_heavy_reports() -> dict | None:
+    tok = get_hf_token()
+    try:
+        res = requests.get(
+            f"{CLOUD_HEAVY_URL}?t={int(time.time() * 1000)}",
+            headers={"Authorization": f"Bearer {tok}", "Cache-Control": "no-cache"},
+            timeout=15
+        )
+        if res.status_code == 200:
+            return res.json()
+    except Exception as e:
+        logger.warning(f"⚠️ Cloud heavy reports fetch error: {e}")
+    return None
+
+
 def restore_database_from_cloud(app_module=None, force_seed: bool = False) -> bool:
     """
     Restores SQLite database (agents, settings, mappings, users, logs) from the
@@ -253,12 +268,18 @@ def restore_database_from_cloud(app_module=None, force_seed: bool = False) -> bo
 
         global _last_resolve_audit_bundle, _last_resolve_audit_ts, _last_auto_resolver_pool, _last_auto_resolver_ts, _last_pending_summary, _last_delays_report, _last_cw_labels, _needs_heavy_push
         existing_audit = cloud_data.get("resolve_audit")
+        existing_ar = cloud_data.get("auto_resolver_pool")
+        if not existing_audit or not existing_ar:
+            heavy_cloud = fetch_cloud_heavy_reports()
+            if isinstance(heavy_cloud, dict):
+                existing_audit = existing_audit or heavy_cloud.get("resolve_audit")
+                existing_ar = existing_ar or heavy_cloud.get("auto_resolver_pool")
+
         if existing_audit and isinstance(existing_audit, dict) and existing_audit.get("data"):
             _last_resolve_audit_bundle = existing_audit
             if _last_resolve_audit_ts == 0:
                 _last_resolve_audit_ts = time.time()
 
-        existing_ar = cloud_data.get("auto_resolver_pool")
         if existing_ar and isinstance(existing_ar, dict) and existing_ar.get("items"):
             _last_auto_resolver_pool = existing_ar
             if _last_auto_resolver_ts == 0:
@@ -843,13 +864,20 @@ def export_and_push_to_cloud(app_module, num_pages: int = 0, summary: str = "Syn
 
         if not fast_only or _needs_heavy_push:
             _needs_heavy_push = False
-            heavy_payload = {
-                "updated_at": datetime.now(CAIRO_TZ).strftime("%Y-%m-%d %H:%M:%S"),
-                "resolve_audit": _last_resolve_audit_bundle,
-                "auto_resolver_pool": _last_auto_resolver_pool
-            }
-            b64_heavy = base64.b64encode(json.dumps(heavy_payload, ensure_ascii=False).encode("utf-8")).decode("ascii")
-            lines.append(json.dumps({"key": "file", "value": {"content": b64_heavy, "path": "reports_heavy.json", "encoding": "base64"}}))
+            has_ar_items = isinstance(_last_auto_resolver_pool, dict) and len(_last_auto_resolver_pool.get("items") or []) > 0
+            if not has_ar_items:
+                heavy_cloud = fetch_cloud_heavy_reports()
+                if isinstance(heavy_cloud, dict) and isinstance(heavy_cloud.get("auto_resolver_pool"), dict) and len(heavy_cloud["auto_resolver_pool"].get("items") or []) > 0:
+                    _last_auto_resolver_pool = heavy_cloud["auto_resolver_pool"]
+                    has_ar_items = True
+            if has_ar_items:
+                heavy_payload = {
+                    "updated_at": datetime.now(CAIRO_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+                    "resolve_audit": _last_resolve_audit_bundle,
+                    "auto_resolver_pool": _last_auto_resolver_pool
+                }
+                b64_heavy = base64.b64encode(json.dumps(heavy_payload, ensure_ascii=False).encode("utf-8")).decode("ascii")
+                lines.append(json.dumps({"key": "file", "value": {"content": b64_heavy, "path": "reports_heavy.json", "encoding": "base64"}}))
 
         ndjson_body = "\n".join(lines)
 

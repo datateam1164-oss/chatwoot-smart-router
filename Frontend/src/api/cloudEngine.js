@@ -68,27 +68,48 @@ async function ensureHeavyReportsLoaded(db, forceRefresh = false) {
     return db;
   }
 
-  if (!forceRefresh && _heavyReportsCache && (now - _heavyReportsCacheTs < 60000)) {
+  const cacheHasAr = Array.isArray(_heavyReportsCache?.auto_resolver_pool?.items) && _heavyReportsCache.auto_resolver_pool.items.length > 0;
+  if (!forceRefresh && _heavyReportsCache && cacheHasAr && (now - _heavyReportsCacheTs < 60000)) {
     db.resolve_audit = _heavyReportsCache.resolve_audit || db.resolve_audit;
     db.auto_resolver_pool = filterResolvedFromPool(_heavyReportsCache.auto_resolver_pool || db.auto_resolver_pool);
     return db;
   }
 
+  let heavy = null;
   try {
     const res = await fetch(`${CLOUD_HEAVY_URL}?t=${now}`, {
       cache: 'no-store',
       headers: { Authorization: `Bearer ${getHfToken()}` }
     });
-    if (res.ok) {
-      const heavy = await res.json();
-      if (heavy.auto_resolver_pool) filterResolvedFromPool(heavy.auto_resolver_pool);
-      _heavyReportsCache = heavy;
+    if (res.ok) heavy = await res.json();
+  } catch (_) {}
+
+  if (!heavy || !Array.isArray(heavy?.auto_resolver_pool?.items) || heavy.auto_resolver_pool.items.length === 0) {
+    try {
+      const res2 = await fetch(`${CLOUD_HEAVY_URL}?t=${now}`, { cache: 'no-store' });
+      if (res2.ok) heavy = await res2.json();
+    } catch (_) {}
+  }
+
+  if (heavy && typeof heavy === 'object') {
+    if (Array.isArray(heavy?.auto_resolver_pool?.items) && heavy.auto_resolver_pool.items.length > 0) {
+      filterResolvedFromPool(heavy.auto_resolver_pool);
+      db.auto_resolver_pool = heavy.auto_resolver_pool;
+    } else if (cacheHasAr) {
+      db.auto_resolver_pool = filterResolvedFromPool(_heavyReportsCache.auto_resolver_pool);
+    }
+    if (heavy.resolve_audit) {
+      db.resolve_audit = heavy.resolve_audit;
+    }
+    if (Array.isArray(db?.auto_resolver_pool?.items) && db.auto_resolver_pool.items.length > 0) {
+      _heavyReportsCache = {
+        resolve_audit: db.resolve_audit,
+        auto_resolver_pool: db.auto_resolver_pool
+      };
       _heavyReportsCacheTs = now;
-      if (heavy.resolve_audit) db.resolve_audit = heavy.resolve_audit;
-      if (heavy.auto_resolver_pool) db.auto_resolver_pool = heavy.auto_resolver_pool;
       return db;
     }
-  } catch (_) {}
+  }
 
   try {
     if (!_staticBundleCache) {
@@ -1357,7 +1378,7 @@ export async function handleCloudApi(endpoint, options = {}) {
   }
 
   if (pathOnly === '/auto-resolver/scan' && method === 'POST') {
-    await ensureHeavyReportsLoaded(db, Boolean(body.force_refresh));
+    await ensureHeavyReportsLoaded(db, true);
     const targetStatus = String(body.status || 'pending').trim().toLowerCase();
     const labelMode = String(body.label_mode || 'all').trim().toLowerCase();
     const specificLabel = String(body.specific_label || '').trim().toLowerCase();

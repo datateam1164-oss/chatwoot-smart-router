@@ -453,6 +453,7 @@ def _run_single_routing_cycle():
                 del recently_assigned_convs[k]
 
         routed = 0
+        exhausted_labels = set()
         for conv in unassigned:
             cid = str(conv["id"])
 
@@ -486,9 +487,13 @@ def _run_single_routing_cycle():
                         # Conversation does not match allowed Sales labels (e.g. CS, HR, etc.) -> SKIP!
                         continue
 
+                if matched_label in exhausted_labels:
+                    continue
+
                 # Check for eligible sales agents for this specific label
                 eligible = _get_eligible_agents(matched_label=matched_label)
                 if not eligible:
+                    exhausted_labels.add(matched_label)
                     logger.warning(f"⚠️ No eligible agents available for label '{matched_label}'.")
                     continue
 
